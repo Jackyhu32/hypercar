@@ -8,13 +8,14 @@ plugins {
 
 // ---- 版本号机制（与 CI android-ci.yml 配套）----
 // 基础版本：发布时只手改这一行。
-val appVersionName = "0.1.0"
+val appVersionName = "0.1.0+xpeng2"
 
 // CI 构建号：`-Phypercar.buildNumber=<run_number + workflow offset>`（CI 每次 push 传入）。
 //   versionName = 0.1.0.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
-// 本地不传 -P 时就是纯 base 版本（0.1.0 / 1）。
+// 本地不传 -P 时 versionCode=2，便于覆盖 0.1.0+xpeng1（versionCode 1）。
+// 已装更高的 CI versionCode 时，用 -Phypercar.buildNumber 且本机有 keystore.properties。
 val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()
-val baseVersionCode = 1
+val baseVersionCode = 2
 
 android {
     namespace = "io.github.hypercar"

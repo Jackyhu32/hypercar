@@ -194,22 +194,21 @@ object HeadUnitProfiles {
     /**
      * 小鹏 G6 海外 2025（XMARTQIIAF30E5）—— **未实车验证**（据海外 G6 诊断起草）。
      *
-     * generic 已跑到 RECORD + requestUI，屏幕流 RTSP SETUP `type=110` 回 400。
-     * 本档案只改手机侧策略：不发 0x4E0E / EA（不在可收清单）、不断 HFP/A2DP、
-     * 不做主动出站、不等 ctrl 邀请。`touchDisplay` 留空，触摸只用 /info 坐标，
-     * 不改编码分辨率或画质。若仍 400，属于 Rust `build_screen_setup` 硬编码，
-     * 不是档案字段能改的。
+     * 无线档案 B 已能 pair-verify、会话 SETUP、RECORD。屏幕流 SETUP 的 canonical 体
+     * （type=110、latencyMs=25、原样 uuid）在 AirTunes/475.8.3 上曾回 400。Rust 在同一条
+     * 控制连接上再试一次：latencyMs=70、UUID 大写、补 timestampInfo，仍是 H.264 type 110，
+     * 不降分辨率。本档案只改手机侧 iAP2 策略：不发 0x4E0E / EA、不断 HFP/A2DP、
+     * 不做主动出站、不等 ctrl 邀请。`touchDisplay` 留空，触摸只用 /info 坐标。
      */
     val XPENG_G6 = HeadUnitProfile(
         id = "xpeng_g6",
         label = "小鹏 G6（海外）",
         model = "XPENG G6 overseas 2025 / XMARTQIIAF30E5",
         notes = "未实车验证（据海外 G6 诊断起草）。无线档案 B：车机发 0x4301、不发 0x5703、" +
-            "可收仅 0x4155/0x4300/0x4e09/0x4e0b/0x4e0c。generic 已跑到 RECORD+requestUI，" +
-            "屏幕流 SETUP type=110 回 400。故关闭 0x4E0E/EA（不在可收清单）、关闭断 HFP/A2DP 与主动出站" +
-            "（日志里断 HFP 会拆 RFCOMM）、不要求 ctrl 邀请（invite=false 仍能 RECORD）。" +
-            "touchDisplay 留空=只用 /info 触摸坐标，不改编码分辨率/画质。若仍 400，属 build_screen_setup " +
-            "硬编码（latencyMs/uuid），需改 Rust，非档案字段。",
+            "可收仅 0x4155/0x4300/0x4e09/0x4e0b/0x4e0c。关闭 0x4E0E/EA、关闭断 HFP/A2DP 与主动出站" +
+            "（日志里断 HFP 会拆 RFCOMM）、不要求 ctrl 邀请。touchDisplay 留空=只用 /info 触摸坐标，" +
+            "不改编码分辨率/画质。屏幕 SETUP 仍先发 catplay 原版（latencyMs=25）；若 400，Rust 在同一连接" +
+            "改试 latencyMs=70、UUID 大写、timestampInfo，type 保持 110。档案字段改不了这套报文体。",
         verified = false,
         validatesDeviceId = false,
         sendCarPlayAvailability = true,

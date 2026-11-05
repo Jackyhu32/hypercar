@@ -26,27 +26,53 @@ impl ScreenSession {
             matches!(self.params.pipeline.lock().video_stream.as_str(), "PAUSED" | "FAILED")
     }
     pub async fn open(&self) -> Result<ScreenSender,String> {
-        let conn_id=airplay::random_positive_i64();
-        let body=airplay::build_screen_setup(conn_id,&self.uuid);
-        let response=self.control.request("SETUP","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await?;
-        if response.status()!=200 { return Err(format!("屏幕 SETUP 被拒 {}",response.first_line)); }
-        let root=bplist::parse(&response.body).map_err(|e|format!("屏幕 SETUP 解析失败 {e}"))?;
-        let port=root.get("streams").and_then(Value::as_array).and_then(|s|s.first())
-            .map(|s|airplay::port_of(s.get("dataPort"))).unwrap_or(0);
-        if port==0 { return Err("屏幕 SETUP 没有 dataPort".into()); }
-        let cipher=match &self.shared {
-            Some(shared)=>ScreenCipher::ChaCha(airplay::stream_key(shared,conn_id as u64)),
-            None=>{let (key,iv)=airplay::aes_stream_keys_zero(conn_id as u64);ScreenCipher::AesCtr(crate::crypto::Aes128CtrStream::new(&key,&iv))},
-        };
-        let socket=self.factory.open_tcp(&self.params.car_ip,port,5000).ok_or_else(||format!("屏幕端口 {port} 连接失败"))?;
-        let (_,write)=socket.into_split();
-        let (w,h)=*self.params.encoder_size.lock();
-        let mut sender=ScreenSender::new(write,cipher,w,h,self.keep_stats);
-        sender.attach_diagnostics(self.params.pipeline.clone(),conn_id as u64);
-        if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }
-        sender.set_ownership(self.owned.clone());
-        crate::emit_log(&format!("AIRPLAY: 主屏 TCP 就绪 dataPort={port} connId={conn_id} source={w}x{h}; new cipher/config state"));
-        Ok(sender)
+        // 先发 catplay 原版（宝马已上车）。只有 400 才在同一条控制连接上换一套字段再试一次。
+        // 其它状态（断连、超时、非 400）不重试：连接已经不可用，再写只会拖到车机拆热点。
+        let kinds=[airplay::ScreenSetupKind::Canonical, airplay::ScreenSetupKind::AirTunes475];
+        let total=kinds.len();
+        let mut first_400: Option<String>=None;
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let conn_id=airplay::random_positive_i64();
+            let body=airplay::build_screen_setup_kind(conn_id,&self.uuid,kind);
+            crate::emit_log(&format!(
+                "AIRPLAY: 屏幕 SETUP {} {}/{} body={}B connId={conn_id}",
+                kind.label(), index+1, total, body.len()
+            ));
+            let response=self.control.request("SETUP","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await?;
+            if response.status()==400 && index+1<total {
+                first_400=Some(response.first_line.clone());
+                crate::emit_log(&format!(
+                    "AIRPLAY: 屏幕 SETUP 400 [{}] body={}B，同一连接改试 latencyMs=70、UUID 大写、timestampInfo（type 仍 110，不改分辨率）",
+                    response.first_line, response.body.len()
+                ));
+                continue;
+            }
+            if response.status()!=200 {
+                let prior=first_400.map(|line| format!("首次[{line}]；")).unwrap_or_default();
+                return Err(format!("屏幕 SETUP 被拒 {prior}[{}]（uuid={}）", response.first_line, self.uuid));
+            }
+            let root=bplist::parse(&response.body).map_err(|e|format!("屏幕 SETUP 解析失败 {e}"))?;
+            let port=root.get("streams").and_then(Value::as_array).and_then(|s|s.first())
+                .map(|s|airplay::port_of(s.get("dataPort"))).unwrap_or(0);
+            if port==0 { return Err("屏幕 SETUP 没有 dataPort".into()); }
+            let cipher=match &self.shared {
+                Some(shared)=>ScreenCipher::ChaCha(airplay::stream_key(shared,conn_id as u64)),
+                None=>{let (key,iv)=airplay::aes_stream_keys_zero(conn_id as u64);ScreenCipher::AesCtr(crate::crypto::Aes128CtrStream::new(&key,&iv))},
+            };
+            let socket=self.factory.open_tcp(&self.params.car_ip,port,5000).ok_or_else(||format!("屏幕端口 {port} 连接失败"))?;
+            let (_,write)=socket.into_split();
+            let (w,h)=*self.params.encoder_size.lock();
+            let mut sender=ScreenSender::new(write,cipher,w,h,self.keep_stats);
+            sender.attach_diagnostics(self.params.pipeline.clone(),conn_id as u64);
+            if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }
+            sender.set_ownership(self.owned.clone());
+            crate::emit_log(&format!(
+                "AIRPLAY: ✓ 主屏流就绪 dataPort={port} connId={conn_id} source={w}x{h} setup={}; new cipher/config state",
+                kind.label()
+            ));
+            return Ok(sender);
+        }
+        Err(format!("屏幕 SETUP 被拒（uuid={}）", self.uuid))
     }
 
     pub async fn install(&self,sender:ScreenSender) -> Result<(),String> {
@@ -108,7 +134,10 @@ mod tests {
         }
     }
     async fn reply(car:&mut TcpStream,msg:&crate::rtsp::RtspMessage,body:&[u8]) {
-        car.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",msg.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();
+        reply_status(car,msg,"200 OK",body).await;
+    }
+    async fn reply_status(car:&mut TcpStream,msg:&crate::rtsp::RtspMessage,status:&str,body:&[u8]) {
+        car.write_all(format!("RTSP/1.0 {status}\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",msg.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();
         car.write_all(body).await.unwrap();
     }
     #[tokio::test]
@@ -186,5 +215,62 @@ mod tests {
             control.post_fire_and_forget("/feedback",&[],"application/octet-stream").await.unwrap();
             assert!(read(&mut car).await.first_line.contains("/feedback"));
         }
+    }
+
+    fn params(pipeline:Arc<Mutex<crate::pipeline::Pipeline>>)->AirplayParams {
+        AirplayParams {
+            car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),identity_path:"test".into(),
+            receiver_id:None,receiver_previously_connected:true,enable_audio:true,keep_alive_stats:false,
+            bmw_box_bootstrap:true,desktop_receiver:false,width:2560,height:1236,touch_display:Some((1920,1080)),touch_rect:None,
+            encoder_size:Arc::new(Mutex::new((2560,1236))),touch_size:Arc::new(Mutex::new((2560,1236))),
+            carwith_display:None,carwith_stretch:false,ui_retake_recovery:false,screen_stream_recovery:true,pipeline,
+        }
+    }
+
+    #[tokio::test]
+    async fn screen_setup_retries_once_after_400_without_lowering_resolution() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car,_)=listener.accept().await.unwrap();
+        let (r,w)=phone.into_split();let (control,_)=RtspChannel::spawn(r,w,None);
+        let video=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port=video.local_addr().unwrap().port() as i64;
+        let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let (commands,_rx)=mpsc::channel(1);
+        let session=ScreenSession {
+            control:control.clone(),factory:Arc::new(Factory),params:params(pipeline),
+            shared:Some([9;32]),uuid:"e5f7a68d-7b0f-4305-984b-974f677a150b".into(),keep_stats:false,
+            display:(2560,1236),owned:Arc::new(AtomicBool::new(true)),commands,initialized:AtomicBool::new(false),
+        };
+        let opening=tokio::spawn(async move { session.open().await });
+        let first=read(&mut car).await;
+        assert!(first.first_line.starts_with("SETUP"));
+        let first_root=bplist::parse(&first.body).unwrap();
+        let first_stream=&first_root.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(first_stream.get("type").and_then(Value::as_int),Some(110));
+        assert_eq!(first_stream.get("latencyMs").and_then(Value::as_int),Some(25));
+        assert_eq!(first_stream.get("uuid").and_then(Value::as_str),Some("e5f7a68d-7b0f-4305-984b-974f677a150b"));
+        assert!(first_stream.get("timestampInfo").is_none());
+        reply_status(&mut car,&first,"400 Bad Request",&[]).await;
+        let second=read(&mut car).await;
+        assert!(second.first_line.starts_with("SETUP"));
+        let second_root=bplist::parse(&second.body).unwrap();
+        let second_stream=&second_root.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(second_stream.get("type").and_then(Value::as_int),Some(110));
+        assert_eq!(second_stream.get("latencyMs").and_then(Value::as_int),Some(70));
+        assert_eq!(second_stream.get("uuid").and_then(Value::as_str),Some("E5F7A68D-7B0F-4305-984B-974F677A150B"));
+        assert_eq!(second_stream.get("timestampInfo").unwrap().as_array().unwrap().len(),5);
+        assert_ne!(
+            first_stream.get("streamConnectionID").and_then(Value::as_int),
+            second_stream.get("streamConnectionID").and_then(Value::as_int)
+        );
+        let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
+            ("type",Value::int(110)),("dataPort",Value::int(port)),
+        ])]))]));
+        reply(&mut car,&second,&body).await;
+        let sender=opening.await.unwrap().unwrap();
+        assert_eq!(sender.size(),(2560,1236));
+        drop(sender);
+        let _=tokio::time::timeout(Duration::from_secs(2),video.accept()).await.unwrap();
     }
 }
