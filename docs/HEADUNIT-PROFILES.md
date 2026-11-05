@@ -1,6 +1,6 @@
 # 车机档案
 
-更新：2026-11-03。权威来源是运行代码及有效远程配置，旧注释中的试验建议不作为当前值。
+更新：2026-11-04。权威来源是运行代码及有效远程配置，旧注释中的试验建议不作为当前值。
 
 ## 内置档案
 
@@ -10,10 +10,11 @@
 | generic | true | true | false | true | 7000 |
 | winplay | false | true | false | false | 7000 |
 | audi_mib3 | true | true | false | true | 7000/7001/7100/17000 |
+| xpeng_g6 | false | false | false | true | 7000/7001/7100/17000 |
 
-BMW / generic 启用 sendCarPlayAvailability、openEaSessions、sendTransportIdentifier；WinPlay / Audi 关闭这三项。四项档案均回复电源更新，且不因 CarPlay 窗口关闭立即主动中止。WinPlay 校验 deviceID，并保留历史触摸兜底 2732×794；这不是宝马的固定分辨率。
+BMW / generic / 小鹏 G6 启用 sendCarPlayAvailability。BMW / generic 同时启用 openEaSessions 与 sendTransportIdentifier；WinPlay / Audi / 小鹏 G6 关闭这两项。五项档案均回复电源更新，且不因 CarPlay 窗口关闭立即主动中止。WinPlay 校验 deviceID，并保留历史触摸兜底 2732×794；这不是宝马的固定分辨率。小鹏 G6 的 touchDisplay 留空，触摸只用 /info 坐标，不改编码分辨率或画质。
 
-BMW MGU-55 是当前实车基准。Audi 尚未完成本项目实车验证；generic 的 verified 字段也不代表所有车型均已测试。未知 ID 回退到 BMW。
+BMW MGU-55 是当前实车基准。Audi 与小鹏 G6 尚未完成本项目实车验证；generic 的 verified 字段也不代表所有车型均已测试。未知 ID 回退到 BMW。
 
 实现：[HeadUnitProfile](../app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt)。
 
