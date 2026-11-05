@@ -190,8 +190,45 @@ object HeadUnitProfiles {
         touchDisplay = null,
         pairingHint = "首次要在 MMI 里选「Apple CarPlay」并确认这台手机（车机会弹提示）",
     )
+
+    /**
+     * 小鹏 G6 海外 2025（XMARTQIIAF30E5）—— **未实车验证**（据海外 G6 诊断起草）。
+     *
+     * generic 已跑到 RECORD + requestUI，屏幕流 RTSP SETUP `type=110` 回 400。
+     * 本档案只改手机侧策略：不发 0x4E0E / EA（不在可收清单）、不断 HFP/A2DP、
+     * 不做主动出站、不等 ctrl 邀请。`touchDisplay` 留空，触摸只用 /info 坐标，
+     * 不改编码分辨率或画质。若仍 400，属于 Rust `build_screen_setup` 硬编码，
+     * 不是档案字段能改的。
+     */
+    val XPENG_G6 = HeadUnitProfile(
+        id = "xpeng_g6",
+        label = "小鹏 G6（海外）",
+        model = "XPENG G6 overseas 2025 / XMARTQIIAF30E5",
+        notes = "未实车验证（据海外 G6 诊断起草）。无线档案 B：车机发 0x4301、不发 0x5703、" +
+            "可收仅 0x4155/0x4300/0x4e09/0x4e0b/0x4e0c。generic 已跑到 RECORD+requestUI，" +
+            "屏幕流 SETUP type=110 回 400。故关闭 0x4E0E/EA（不在可收清单）、关闭断 HFP/A2DP 与主动出站" +
+            "（日志里断 HFP 会拆 RFCOMM）、不要求 ctrl 邀请（invite=false 仍能 RECORD）。" +
+            "touchDisplay 留空=只用 /info 触摸坐标，不改编码分辨率/画质。若仍 400，属 build_screen_setup " +
+            "硬编码（latencyMs/uuid），需改 Rust，非档案字段。",
+        verified = false,
+        validatesDeviceId = false,
+        sendCarPlayAvailability = true,
+        openEaSessions = false,
+        sendTransportIdentifier = false,
+        replyPowerUpdates = true,
+        dropProfilesBeforeIap2 = false,
+        allowOutboundIap2 = false,
+        abortWhenCarPlayWindowClosed = false,
+        preferMdnsAirplay = true,
+        requireAirplayActivation = false,
+        fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
+        touchDisplay = null,
+        pairingHint = "车机弹出 CarPlay 授权后点接受；保持蓝牙 HFP 勿被系统/其它 App 强断；" +
+            "热点加入后等约 3–5 秒再重试；分辨率/帧率在设置「画面」里自定，本档案不降画质。",
+    )
+
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
-    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3)
+    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3, XPENG_G6)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。
