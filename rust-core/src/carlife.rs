@@ -148,6 +148,10 @@ pub struct CarLifeHub {
 }
 
 impl CarLifeHub {
+    pub(crate) fn encoder_size_handle(&self) -> &Arc<Mutex<(u32, u32)>> {
+        &self.encoder_size
+    }
+
     /// **主动连接模式**（盒子角色）：MD（手机上的 CarLife/CarWith）在标准端口上监听，
     /// 由 HU 侧逐个拨过去。
     ///

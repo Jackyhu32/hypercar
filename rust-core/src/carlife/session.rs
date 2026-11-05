@@ -271,6 +271,29 @@ mod tests {
     use super::*;
     fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
     fn info()->Vec<u8> {let mut out=Vec::new(); for (field,text) in [(4,"Xiaomi"),(14,"test"),(20,"37")] {proto::string(&mut out,field,text);} out}
+    fn parse_feature_config(bytes: &[u8]) -> Vec<(String, u64)> {
+        let mut i = 0;
+        let mut out = Vec::new();
+        while i < bytes.len() {
+            let (tag, n) = pb_read_varint(bytes, i).unwrap();
+            i = n;
+            match tag & 7 {
+                0 => { let (_, n) = pb_read_varint(bytes, i).unwrap(); i = n; }
+                2 => {
+                    let (len, n) = pb_read_varint(bytes, i).unwrap();
+                    i = n;
+                    let end = i + len as usize;
+                    let entry = &bytes[i..end];
+                    i = end;
+                    if tag >> 3 == 2 {
+                        out.push((pb_first_string(entry, 1).unwrap_or_default(), first_int(entry, 2).unwrap_or(0)));
+                    }
+                }
+                _ => break,
+            }
+        }
+        out
+    }
     fn prepared()->Session {
         let mut s=Session::default();
         s.receive(CMD_VERSION_MATCH_STATUS,&proto_authen_result_payload(true),&cfg()).unwrap();
@@ -313,7 +336,7 @@ mod tests {
         assert!(!s.init_sent);
         let actions=s.receive(CMD_MD_AUTHEN_RESPONSE,&proof(&s),&cfg()).unwrap();
         assert_eq!(actions.iter().map(|a|a.0).collect::<Vec<_>>(),vec![CMD_HU_AUTHEN_RESULT,CMD_HU_FEATURE_CONFIG_RESPONSE]);
-        assert_eq!(parse_feature_config(&actions[1].1),vec![("CONTENT_ENCRYPTION".into(),1)]);
+        assert_eq!(parse_feature_config(&actions[1].1),vec![("CONTENT_ENCRYPTION".into(),1u64)]);
         assert!(!s.init_sent);
         assert!(s.receive(CMD_MD_ENCRYPT_READY,&[],&cfg()).is_err());
     }
@@ -358,7 +381,7 @@ mod tests {
             stream.read_exact(&mut body).await.unwrap();
             u32::from_be_bytes(header[4..8].try_into().unwrap())
         }
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (mut phone, _) = listener.accept().await.unwrap();
         let state = Shared::new(Mutex::new(Session::default()));

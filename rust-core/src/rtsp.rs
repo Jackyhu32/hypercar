@@ -118,6 +118,15 @@ impl RtspMessage {
         self.headers.get("cseq").and_then(|s| s.parse().ok())
     }
 
+    /// 请求行的方法（`TEARDOWN / RTSP/1.0` → `TEARDOWN`）。应答行返回 None。
+    pub fn method(&self) -> Option<&str> {
+        if self.is_response() {
+            None
+        } else {
+            self.first_line.split_whitespace().next()
+        }
+    }
+
 }
 
 /// 增量重组：从裸字节流切出完整 RTSP 消息，残余留在 buf。

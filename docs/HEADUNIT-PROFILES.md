@@ -14,6 +14,20 @@
 
 BMW / generic / 小鹏 G6 启用 sendCarPlayAvailability。BMW / generic 同时启用 openEaSessions 与 sendTransportIdentifier；WinPlay / Audi / 小鹏 G6 关闭这两项。五项档案均回复电源更新，且不因 CarPlay 窗口关闭立即主动中止。WinPlay 校验 deviceID，并保留历史触摸兜底 2732×794；这不是宝马的固定分辨率。小鹏 G6 的 touchDisplay 留空，触摸只用 /info 坐标，不改编码分辨率或画质。
 
+### 小鹏 G6 屏幕流 SETUP
+
+2025 海外 G6（AirTunes/475.8.3，srcvers=475.8.3）在 pair-verify、会话 SETUP、`/info`、RECORD 都 200 之后，主屏 `SETUP /` 对 catplay 原版报文体回 `400`、body=0。该体约 167 字节：`type=110`、`streamConnectionID`、`/info` 的 uuid、`latencyMs=25`。Mazda AirTunes 320 接受同一形状。
+
+已核对、不是这次 400 的原因：
+
+- 会话 SETUP 使用 `TimingServer` 绑定到的真实 UDP 端口。`timingPort=0` 才会让屏幕 SETUP 400；端口绑定失败时走不到会话 SETUP 的 200。成功日志现在带 `timingPort=`。
+- 触摸设置仍可能是 1920×1080，而 `/info` 画布是 2560×1236。屏幕 SETUP 不含宽高；第二轮引擎配置已经是 2560×1236 时 SETUP 仍然 400。`/info` 有像素时触摸分母用显示尺寸，不把编码压到 720p。
+- `enabledFeatures` 里的 `mainBuffered` 是缓冲音频，不是把主屏改成 type 111。111 是 altScreen，库存接收端对 111 走不支持分支并 400。`/info features=0x6104040280` 是顶层 AirPlay 标志（screen、audio、PCM、MFi、car、CarPlay control、HK），不是显示器特性位。
+
+宝马仍先发原来的 25ms 体。只有这一次返回 400 时，同一条控制连接再用新的 `streamConnectionID` 发第二套，仍是 H.264 type 110：`latencyMs=70`（盖住 60fps 两帧，不改码率或分辨率）、uuid 转成 Apple `CFUUIDCreateString` 的大写形式、补上镜像 SETUP 的 `timestampInfo`（SubSu、BePxT、AfPxT、BefEn、EmEnc）。非 400 的失败不重试。
+
+成功时日志有 `AIRPLAY: ✓ 主屏流就绪 dataPort=…`，随后状态为 connected。第二套仍 400 时引擎退出，错误里带上两次状态行。这还没有这台 G6 的实车确认。
+
 BMW MGU-55 是当前实车基准。Audi 与小鹏 G6 尚未完成本项目实车验证；generic 的 verified 字段也不代表所有车型均已测试。未知 ID 回退到 BMW。
 
 实现：[HeadUnitProfile](../app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt)。

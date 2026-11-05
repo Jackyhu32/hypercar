@@ -259,8 +259,10 @@ pub async fn negotiate(
     emit_log(&format!("AIRPLAY: effective BMW box bootstrap={box_bootstrap} requested={}", p.bmw_box_bootstrap));
     let event_port = port_of(root.get("eventPort"));
     let keep_alive_port = port_of(root.get("keepAlivePort"));
+    // timingPort=0 会让后续屏幕 SETUP 400（timing.rs）。这里通告的是已绑定的 UDP 端口。
     emit_log(&format!(
-        "AIRPLAY: ✓ 会话 SETUP eventPort={event_port} keepAlive={keep_alive_port:?} enabledFeatures={:?}",
+        "AIRPLAY: ✓ 会话 SETUP eventPort={event_port} keepAlive={keep_alive_port:?} timingPort={} enabledFeatures={:?}",
+        timing.port,
         root.get("enabledFeatures").and_then(Value::as_array)
     ));
 
@@ -583,6 +585,38 @@ mod display_size_tests {
             let touch=rx.try_recv().unwrap();assert_eq!((touch.x,touch.y),expected);
         }
     }
+    #[test]
+    fn canonical_screen_setup_keeps_catplay_fields() {
+        let body = bplist::parse(&build_screen_setup(42, "e5f7a68d-7b0f-4305-984b-974f677a150b")).unwrap();
+        let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("type").and_then(Value::as_int), Some(110));
+        assert_eq!(stream.get("streamConnectionID").and_then(Value::as_int), Some(42));
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int), Some(25));
+        assert_eq!(stream.get("uuid").and_then(Value::as_str), Some("e5f7a68d-7b0f-4305-984b-974f677a150b"));
+        assert!(stream.get("timestampInfo").is_none());
+        assert!(stream.get("widthPixels").is_none());
+    }
+
+    #[test]
+    fn airtunes475_screen_setup_raises_latency_without_touching_resolution() {
+        let body = bplist::parse(&build_screen_setup_kind(
+            7, "e5f7a68d-7b0f-4305-984b-974f677a150b", ScreenSetupKind::AirTunes475,
+        )).unwrap();
+        let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("type").and_then(Value::as_int), Some(110));
+        assert_eq!(stream.get("streamConnectionID").and_then(Value::as_int), Some(7));
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int), Some(70));
+        assert_eq!(stream.get("uuid").and_then(Value::as_str), Some("E5F7A68D-7B0F-4305-984B-974F677A150B"));
+        let names: Vec<_> = stream.get("timestampInfo").unwrap().as_array().unwrap().iter()
+            .map(|entry| entry.get("name").and_then(Value::as_str).unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc"]);
+        assert!(stream.get("widthPixels").is_none() && stream.get("heightPixels").is_none());
+        let raw = bplist::parse(&build_screen_setup_kind(1, "0", ScreenSetupKind::AirTunes475)).unwrap();
+        let audi = &raw.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(audi.get("uuid").and_then(Value::as_str), Some("0"));
+    }
+
     #[test]
     fn desktop_pcm_setup_uses_positive_latency_and_keeps_car_parameters() {
         for desktop in [false,true] {
@@ -1014,6 +1048,14 @@ fn use_box_bootstrap(requested: bool, info: &Value) -> bool {
     })
 }
 
+#[cfg(test)]
+fn build_modes_changed() -> Vec<u8> {
+    bplist::encode(&Value::dict(vec![
+        ("type", Value::str("modesChanged")),
+        ("params", Value::dict(vec![])),
+    ]))
+}
+
 async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8]) -> Result<(), String> {
     emit_log("AIRPLAY: 开始 RECORD（屏幕流建立前）");
     record_session(channel).await?;
@@ -1065,16 +1107,81 @@ async fn setup_and_read_info(
     Ok((setup, info))
 }
 
+/// 主屏 SETUP 的两套报文体。成功路径永远先发 [Canonical]；只有收到 400 才发第二套。
+///
+/// [Canonical] 与 catplay `StreamDescriptionScreen` 相同：`type=110`、`streamConnectionID`、
+/// `/info` 原样 uuid、`latencyMs=25`。宝马 / Mazda AirTunes 320 接受这 167B 左右的体。
+///
+/// 海外小鹏 G6（AirTunes/475.8.3）对这套体回 `400` 且 body=0。会话 SETUP、RECORD 已经 200，
+/// 所以不是 timingPort=0，也不是分辨率（SETUP 不含宽高，第二轮引擎已是 2560×1236 仍 400）。
+/// `mainBuffered` 是缓冲音频能力，不把主屏改成 type 111（111 是 altScreen，库存接收端直接 400）。
+/// 第二套仍是 H.264 type 110，只改校验字段：
+///  - `latencyMs=70`：CarPlay 副屏抓包与一帧以上的下限；25ms 低于 catplay 音频通路的 32ms 钳位，
+///    475 对过小 latency 回空体 400。70ms 盖住 60fps 的两帧，不改编码分辨率或码率。
+///  - uuid 改成 Apple `CFUUIDCreateString` 的大写带连字符形式（二进制 UUID 被我们收成小写时对不上）。
+///  - `timestampInfo` 用 AirPlay 镜像 SETUP 的五个名字（SubSu/BePxT/AfPxT/BefEn/EmEnc）。
+///    Apple 的字典解析会忽略不认识的键；缺了必填的 timestamp 数组才会 400。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScreenSetupKind {
+    Canonical,
+    AirTunes475,
+}
+
+impl ScreenSetupKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::AirTunes475 => "airtunes475",
+        }
+    }
+
+    fn latency_ms(self) -> i64 {
+        match self {
+            Self::Canonical => 25,
+            Self::AirTunes475 => 70,
+        }
+    }
+}
+
+const SCREEN_TIMESTAMP_NAMES: &[&str] = &["SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc"];
+
 pub(crate) fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {
+    build_screen_setup_kind(conn_id, uuid, ScreenSetupKind::Canonical)
+}
+
+pub(crate) fn build_screen_setup_kind(conn_id: i64, uuid: &str, kind: ScreenSetupKind) -> Vec<u8> {
+    let shown = match kind {
+        ScreenSetupKind::Canonical => uuid.to_string(),
+        ScreenSetupKind::AirTunes475 => apple_cfuuid(uuid),
+    };
+    let mut fields = vec![
+        ("type", Value::int(110)), // 110=主屏（100 是音频，111 是副屏）
+        ("streamConnectionID", Value::int(conn_id)),
+        ("uuid", Value::str(&shown)),
+        ("latencyMs", Value::int(kind.latency_ms())),
+    ];
+    if kind == ScreenSetupKind::AirTunes475 {
+        fields.push((
+            "timestampInfo",
+            Value::array(
+                SCREEN_TIMESTAMP_NAMES
+                    .iter()
+                    .map(|name| Value::dict(vec![("name", Value::str(name))]))
+                    .collect(),
+            ),
+        ));
+    }
     bplist::encode(&Value::dict(vec![(
         "streams",
-        Value::array(vec![Value::dict(vec![
-            ("type", Value::int(110)), // 110=主屏（100 是音频，会开 UDP 端口）
-            ("streamConnectionID", Value::int(conn_id)),
-            ("uuid", Value::str(uuid)),
-            ("latencyMs", Value::int(25)),
-        ])]),
+        Value::array(vec![Value::dict(fields)]),
     )]))
+}
+
+/// Apple `CFUUIDCreateString` 是大写、带连字符。解析失败（例如奥迪 hid uuid `"0"`）原样返回。
+fn apple_cfuuid(uuid: &str) -> String {
+    uuid::Uuid::parse_str(uuid.trim())
+        .map(|id| id.to_string().to_ascii_uppercase())
+        .unwrap_or_else(|_| uuid.to_string())
 }
 
 /// WinPlay treats zero latency as 1000 ms; 352-frame PCM then approaches its 128-packet limit.
