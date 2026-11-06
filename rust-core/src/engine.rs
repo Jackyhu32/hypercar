@@ -66,6 +66,9 @@ pub struct EngineConfig {
     pub ui_retake_recovery: bool,
     #[serde(default)]
     pub screen_stream_recovery: bool,
+    /// 档案 id 为 xpeng_g6 时由 Kotlin 置真。只影响屏幕 SETUP 报文体，不改分辨率。
+    #[serde(default)]
+    pub screen_setup_xpeng3: bool,
     #[serde(default)]
     pub desktop_receiver: bool,
     pub identity_path: String,
@@ -428,6 +431,7 @@ pub async fn run_engine(
         carwith_stretch: cfg.carlife_source && cfg.carwith_stretch,
         ui_retake_recovery: cfg.ui_retake_recovery,
         screen_stream_recovery: cfg.screen_stream_recovery,
+        screen_setup_xpeng3: cfg.screen_setup_xpeng3,
         pipeline: pipeline.clone(),
     };
     let outcome = tokio::select! {

@@ -83,7 +83,11 @@ H.264 level 由编码器按尺寸和帧率选择。详见 [推流检查记录](V
 - 提交标题末尾加 `[release]` 或 `[publish]`：测试通过后自动创建 GitHub Release，并附 APK。
 - 提交标题含 `[skip ci]`：跳过工作流任务；适合仅文档／截图的修改。
 - Actions 手动运行并勾选 `publish` 也必须通过测试。
-- 版本号：`appVersionName` + `github.run_number + 400`，versionCode 为 `10000 + 构建号`。
+- 版本号：`appVersionName` + `github.run_number + 400`，versionCode 为 `baseVersionCode * 10000 + 构建号`。
+  当前基础版本名是 `0.1.0+xpeng3`，`baseVersionCode` 为 3。不传 `-Phypercar.buildNumber` 时
+  `versionName=0.1.0+xpeng3`、`versionCode=3`，可以覆盖本地的 +xpeng2（versionCode 2）。
+  CI 产物名为 `HyperCar-0.1.0+xpeng3.<构建号>-release.apk`。没有 `keystore.properties` 时不要传构建号，
+  用 `./gradlew :app:assembleDebug` 打调试包；调试签名不能覆盖已装的正式签名包。
 - 必需 Secrets：`KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`；可选
   `EXPECTED_CERT_SHA256`。缺失正式签名材料会失败，不会退回 debug 签名。
 - Release 说明记录当前功能、环境要求、适配限制，以及本次提交、APK 大小和 SHA-256。
