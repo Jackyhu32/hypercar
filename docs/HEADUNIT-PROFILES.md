@@ -1,6 +1,6 @@
 # 车机档案
 
-更新：2026-11-04。权威来源是运行代码及有效远程配置，旧注释中的试验建议不作为当前值。
+更新：2026-11-06。权威来源是运行代码及有效远程配置，旧注释中的试验建议不作为当前值。
 
 ## 内置档案
 
@@ -14,19 +14,31 @@
 
 BMW / generic / 小鹏 G6 启用 sendCarPlayAvailability。BMW / generic 同时启用 openEaSessions 与 sendTransportIdentifier；WinPlay / Audi / 小鹏 G6 关闭这两项。五项档案均回复电源更新，且不因 CarPlay 窗口关闭立即主动中止。WinPlay 校验 deviceID，并保留历史触摸兜底 2732×794；这不是宝马的固定分辨率。小鹏 G6 的 touchDisplay 留空，触摸只用 /info 坐标，不改编码分辨率或画质。
 
-### 小鹏 G6 屏幕流 SETUP
+### 小鹏 G6 屏幕流 SETUP（+xpeng3）
 
-2025 海外 G6（AirTunes/475.8.3，srcvers=475.8.3）在 pair-verify、会话 SETUP、`/info`、RECORD 都 200 之后，主屏 `SETUP /` 对 catplay 原版报文体回 `400`、body=0。该体约 167 字节：`type=110`、`streamConnectionID`、`/info` 的 uuid、`latencyMs=25`。Mazda AirTunes 320 接受同一形状。
+2026-11-05 17:42 的 +xpeng2 实车日志（`0.1.0+xpeng2`，热点 `Ue7BqjfI`，对端 `fe80::382a:8bff:feca:3dae`）里，pair-verify、会话 SETUP、`/info`、RECORD、requestUI 都过去了，主屏 `SETUP /` 仍是空体 400。同一轮里两套报文体都被拒，连续四次：
 
-已核对、不是这次 400 的原因：
+- `timingPort` 不是 0（52410 / 43282 / 40301 / 60139）
+- `TIMING: before RECORD` 和 `after RECORD` 都是 `requests=0 replies=0`
+- 接着 `屏幕 SETUP canonical 1/2 body=167B` → 14ms 内 400
+- 同一连接 `屏幕 SETUP airtunes475 2/2 body=276B` → 仍然 400
+- 然后引擎退出，重连 7000 得到 `ECONNREFUSED`，热点关掉
 
-- 会话 SETUP 使用 `TimingServer` 绑定到的真实 UDP 端口。`timingPort=0` 才会让屏幕 SETUP 400；端口绑定失败时走不到会话 SETUP 的 200。成功日志现在带 `timingPort=`。
-- 触摸设置仍可能是 1920×1080，而 `/info` 画布是 2560×1236。屏幕 SETUP 不含宽高；第二轮引擎配置已经是 2560×1236 时 SETUP 仍然 400。`/info` 有像素时触摸分母用显示尺寸，不把编码压到 720p。
-- `enabledFeatures` 里的 `mainBuffered` 是缓冲音频，不是把主屏改成 type 111。111 是 altScreen，库存接收端对 111 走不支持分支并 400。`/info features=0x6104040280` 是顶层 AirPlay 标志（screen、audio、PCM、MFi、car、CarPlay control、HK），不是显示器特性位。
+控制连接是 IPv6 链路本地。计时服务此前只绑 `0.0.0.0`，车机发给手机 IPv6 地址的 timesync 到不了这个口。屏幕 SETUP 又紧跟 RECORD（大约 1ms），所以日志里的 `requests=0` 既可能是套接字族不对，也可能是还没等到第一包。四次不同的 `connId` 都 400，不把连接号策略当下一刀。`enabledFeatures` 含 `h.264Level5.1` 和 `altScreen`，主屏仍是 type 110，不改成 111。编码保持 2560×1236。
 
-宝马仍先发原来的 25ms 体。只有这一次返回 400 时，同一条控制连接再用新的 `streamConnectionID` 发第二套，仍是 H.264 type 110：`latencyMs=70`（盖住 60fps 两帧，不改码率或分辨率）、uuid 转成 Apple `CFUUIDCreateString` 的大写形式、补上镜像 SETUP 的 `timestampInfo`（SubSu、BePxT、AfPxT、BefEn、EmEnc）。非 400 的失败不重试。
++xpeng3 不换这两套已失败的报文体。选中档案 id `xpeng_g6` 时：
 
-成功时日志有 `AIRPLAY: ✓ 主屏流就绪 dataPort=…`，随后状态为 connected。第二套仍 400 时引擎退出，错误里带上两次状态行。这还没有这台 G6 的实车确认。
+1. 车机地址是 IPv6 就监听 `TIMING: listening ipv6=[::]`（绑失败才退回 `0.0.0.0` 并打日志）。
+2. 发屏幕 SETUP 前最多等 1.5s，直到 `replies>=1`。
+3. 只发一次 catplay 原版（type 110、`latencyMs=25`、`/info` 原文 uuid）。400 后不再发第二套。
+
+这还没有实车确认会变成 200。看这三行：
+
+- `TIMING: listening ipv6=[::] timingPort=…`
+- `TIMING: before screen SETUP replies=1` 然后 `AIRPLAY: ✓ 主屏流就绪 … source=2560x1236 setup=canonical`：计时应答之后 SETUP 被接受
+- `TIMING: before screen SETUP replies=0` 然后 `屏幕 SETUP 400 setup=canonical`：1.5s 内仍然没有 timesync，下一轮不是再改报文体
+
+宝马及其它档案仍绑 IPv4，仍先发 25ms 原版，400 才试 airtunes475。
 
 BMW MGU-55 是当前实车基准。Audi 与小鹏 G6 尚未完成本项目实车验证；generic 的 verified 字段也不代表所有车型均已测试。未知 ID 回退到 BMW。
 

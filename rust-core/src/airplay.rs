@@ -65,6 +65,11 @@ pub struct AirplayParams {
     pub carwith_stretch: bool,
     pub ui_retake_recovery: bool,
     pub screen_stream_recovery: bool,
+    /// 小鹏 G6：屏幕 SETUP 只发 catplay 原版一次，并先等计时应答。
+    /// +xpeng2 的 canonical 与 airtunes475 都已在实车 400；不再换报文体。
+    pub screen_setup_xpeng3: bool,
+    /// 发屏幕 SETUP 前等待第一条 timesync 应答的上限。零表示不等。
+    pub timing_wait: Duration,
     pub pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
 }
 
@@ -249,7 +254,7 @@ pub async fn negotiate(
     if box_bootstrap { crate::auth_setup::run(&channel).await?; }
 
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
-    let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
+    let timing = TimingServer::start_for_car(p.pipeline.clone(), &p.car_ip).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
         &channel, &p.device_id, timing.port, shared_secret.is_some(), info,
     ).await?;
@@ -615,6 +620,24 @@ mod display_size_tests {
         let raw = bplist::parse(&build_screen_setup_kind(1, "0", ScreenSetupKind::AirTunes475)).unwrap();
         let audi = &raw.get("streams").unwrap().as_array().unwrap()[0];
         assert_eq!(audi.get("uuid").and_then(Value::as_str), Some("0"));
+    }
+
+    #[test]
+    fn xpeng3_sends_only_the_canonical_body() {
+        assert_eq!(
+            screen_setup_order(false),
+            [ScreenSetupKind::Canonical, ScreenSetupKind::AirTunes475].as_slice()
+        );
+        assert_eq!(screen_setup_order(true), [ScreenSetupKind::Canonical].as_slice());
+        let uuid = "e5f7a68d-7b0f-4305-984b-974f677a150b";
+        let body = bplist::parse(&build_screen_setup_kind(7, uuid, screen_setup_order(true)[0])).unwrap();
+        let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("type").and_then(Value::as_int), Some(110));
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int), Some(25));
+        assert_eq!(stream.get("uuid").and_then(Value::as_str), Some(uuid));
+        assert!(stream.get("timestampInfo").is_none());
+        assert!(stream.get("supportsHighAccuracyTimestamps").is_none());
+        assert!(stream.get("widthPixels").is_none() && stream.get("heightPixels").is_none());
     }
 
     #[test]
@@ -1107,20 +1130,14 @@ async fn setup_and_read_info(
     Ok((setup, info))
 }
 
-/// 主屏 SETUP 的两套报文体。成功路径永远先发 [Canonical]；只有收到 400 才发第二套。
+/// 主屏 SETUP 报文体。
 ///
 /// [Canonical] 与 catplay `StreamDescriptionScreen` 相同：`type=110`、`streamConnectionID`、
-/// `/info` 原样 uuid、`latencyMs=25`。宝马 / Mazda AirTunes 320 接受这 167B 左右的体。
+/// `/info` 原样 uuid、`latencyMs=25`。宝马 / Mazda AirTunes 320 接受这约 167B 的体。
+/// 非小鹏路径仍先发它；只有 400 才在同一连接上发 [AirTunes475]。
 ///
-/// 海外小鹏 G6（AirTunes/475.8.3）对这套体回 `400` 且 body=0。会话 SETUP、RECORD 已经 200，
-/// 所以不是 timingPort=0，也不是分辨率（SETUP 不含宽高，第二轮引擎已是 2560×1236 仍 400）。
-/// `mainBuffered` 是缓冲音频能力，不把主屏改成 type 111（111 是 altScreen，库存接收端直接 400）。
-/// 第二套仍是 H.264 type 110，只改校验字段：
-///  - `latencyMs=70`：CarPlay 副屏抓包与一帧以上的下限；25ms 低于 catplay 音频通路的 32ms 钳位，
-///    475 对过小 latency 回空体 400。70ms 盖住 60fps 的两帧，不改编码分辨率或码率。
-///  - uuid 改成 Apple `CFUUIDCreateString` 的大写带连字符形式（二进制 UUID 被我们收成小写时对不上）。
-///  - `timestampInfo` 用 AirPlay 镜像 SETUP 的五个名字（SubSu/BePxT/AfPxT/BefEn/EmEnc）。
-///    Apple 的字典解析会忽略不认识的键；缺了必填的 timestamp 数组才会 400。
+/// 小鹏 G6 的 +xpeng2 实车日志里这两套都是 400（167B 与 276B），而且当时
+/// `TIMING requests=0`。+xpeng3 不再改这套报文体，也不再在 400 后重试。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScreenSetupKind {
     Canonical,
@@ -1135,11 +1152,20 @@ impl ScreenSetupKind {
         }
     }
 
-    fn latency_ms(self) -> i64 {
+    pub(crate) fn latency_ms(self) -> i64 {
         match self {
             Self::Canonical => 25,
             Self::AirTunes475 => 70,
         }
+    }
+}
+
+/// 小鹏 G6 只发 canonical 一次。其它车机仍是 canonical，400 后再试 airtunes475。
+pub(crate) fn screen_setup_order(xpeng3: bool) -> &'static [ScreenSetupKind] {
+    if xpeng3 {
+        &[ScreenSetupKind::Canonical]
+    } else {
+        &[ScreenSetupKind::Canonical, ScreenSetupKind::AirTunes475]
     }
 }
 

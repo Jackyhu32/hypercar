@@ -119,8 +119,9 @@ pub fn build_timesync_response(request: &[u8], now_nanos: u64) -> Option<[u8; PA
     Some(response)
 }
 
-/// AirPlay 计时服务：绑定 0.0.0.0:0 UDP（端口由 OS 分配， SETUP 应答里把这个
-/// 端口作为 timingPort 通告给车机），后台任务应答 timesync 请求直到 `stop()`。
+/// AirPlay 计时服务。端口由 OS 分配，会话 SETUP 把它作为 timingPort 通告给车机。
+/// IPv4 车机绑 `0.0.0.0`。控制连接是 IPv6（小鹏 G6 的 `fe80::…`）时绑 `[::]`，
+/// 否则车机的 timesync 发不到这个套接字，`requests` 会一直是 0。
 pub struct TimingServer {
     /** 实际绑定的本地 UDP 端口（通告给车机的 timingPort）。 */
     pub port: u16,
@@ -130,6 +131,11 @@ pub struct TimingServer {
     diagnostics: Arc<Mutex<TimingDiagnostics>>,
 }
 
+/// 控制对端是 IPv6 时计时口必须能收 IPv6。解析失败按 IPv4 处理（宝马路径不变）。
+pub fn peer_is_ipv6(car_ip: &str) -> bool {
+    car_ip.parse::<std::net::IpAddr>().map(|addr| addr.is_ipv6()).unwrap_or(false)
+}
+
 impl TimingServer {
     /// 绑定 0.0.0.0:0 并启动永久应答循环（tokio::spawn）。
     ///
@@ -137,12 +143,32 @@ impl TimingServer {
     /// `UdpSocket::from_std`」路径；`from_std` 需要注册到 reactor，因此**必须在
     /// tokio runtime 上下文中调用**（会话流程本就跑在 async 里，天然满足）。
     pub fn start_with_pipeline(pipeline:Arc<Mutex<crate::pipeline::Pipeline>>)->std::io::Result<Self> {
-        Self::start_impl(Some(pipeline))
+        Self::start_impl(Some(pipeline), false)
     }
-    fn start_impl(pipeline:Option<Arc<Mutex<crate::pipeline::Pipeline>>>)->std::io::Result<Self> {
-        let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    /// `car_ip` 为 IPv6（含链路本地）时监听 `[::]`，否则仍是 `0.0.0.0`。
+    pub fn start_for_car(pipeline:Arc<Mutex<crate::pipeline::Pipeline>>, car_ip:&str)->std::io::Result<Self> {
+        let ipv6 = peer_is_ipv6(car_ip);
+        match Self::start_impl(Some(pipeline.clone()), ipv6) {
+            Ok(server) => Ok(server),
+            Err(error) if ipv6 => {
+                crate::emit_log(&format!("TIMING: IPv6 bind failed ({error}); falling back to 0.0.0.0 — link-local timesync cannot arrive"));
+                Self::start_impl(Some(pipeline), false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn start_impl(pipeline:Option<Arc<Mutex<crate::pipeline::Pipeline>>>, ipv6:bool)->std::io::Result<Self> {
+        let std_socket = if ipv6 {
+            std::net::UdpSocket::bind(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0))?
+        } else {
+            std::net::UdpSocket::bind("0.0.0.0:0")?
+        };
         std_socket.set_nonblocking(true)?; // tokio 要求非阻塞模式
         let port = std_socket.local_addr()?.port();
+        crate::emit_log(&format!(
+            "TIMING: listening {} timingPort={port}",
+            if ipv6 { "ipv6=[::]" } else { "ipv4=0.0.0.0" }
+        ));
         let socket = UdpSocket::from_std(std_socket)?;
 
         let diagnostics=Arc::new(Mutex::new(TimingDiagnostics::default()));
@@ -193,6 +219,23 @@ impl TimingServer {
 
 }
 
+/// 等到第一条成功的 timesync 应答，或预算耗尽。屏幕 SETUP 用它避免在
+/// `requests=0` 时就把 type 110 发出去。
+pub async fn wait_for_reply(pipeline:&Arc<Mutex<crate::pipeline::Pipeline>>, budget:std::time::Duration) -> TimingDiagnostics {
+    let start = tokio::time::Instant::now();
+    loop {
+        let snap = {
+            let mut sample = pipeline.lock().timing.clone();
+            sample.refresh_age(monotonic_nanos()/1_000_000);
+            sample
+        };
+        if snap.replies > 0 || start.elapsed() >= budget {
+            return snap;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 impl Drop for TimingServer {
     fn drop(&mut self) { self.task.abort(); }
 }
@@ -217,7 +260,33 @@ mod diagnostics_tests {
         assert_eq!(s.requests,1);assert_eq!(s.replies,1);assert_eq!(s.invalid_datagrams,1);
         assert_eq!(s.send_errors,0);assert!(s.last_local_reply_us.is_some());
         let mut p=pipeline.lock().timing.clone();
+        p.refresh_age(monotonic_nanos()/1_000_000);
+        assert_eq!(p.requests,1);
         p.refresh_age(p.last_reply_ms.unwrap()+5000);assert_eq!(p.reply_age_ms,Some(5000));
+        drop(server);
+    }
+
+    #[test]
+    fn link_local_car_selects_ipv6_timing_socket() {
+        assert!(peer_is_ipv6("fe80::382a:8bff:feca:3dae"));
+        assert!(!peer_is_ipv6("192.168.43.1"));
+        assert!(!peer_is_ipv6("not-an-ip"));
+    }
+
+    #[tokio::test]
+    async fn ipv6_listener_answers_loopback_and_wait_returns_on_first_reply() {
+        let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let server=TimingServer::start_for_car(pipeline.clone(),"fe80::382a:8bff:feca:3dae").unwrap();
+        assert!(server.diagnostics.lock().requests==0);
+        let peer=UdpSocket::bind("[::1]:0").await.unwrap();
+        peer.connect(format!("[::1]:{}", server.port)).await.unwrap();
+        let mut request=[0u8;32];request[0]=0x80;request[1]=0xd2;request[3]=7;
+        peer.send(&request).await.unwrap();
+        let snap=wait_for_reply(&pipeline, std::time::Duration::from_secs(1)).await;
+        assert_eq!(snap.replies,1);
+        assert!(snap.requests>=1);
+        let missed=wait_for_reply(&Arc::new(Mutex::new(crate::pipeline::Pipeline::new())), std::time::Duration::from_millis(40)).await;
+        assert_eq!(missed.replies,0);
         drop(server);
     }
 }

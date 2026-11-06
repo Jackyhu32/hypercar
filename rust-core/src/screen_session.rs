@@ -26,17 +26,27 @@ impl ScreenSession {
             matches!(self.params.pipeline.lock().video_stream.as_str(), "PAUSED" | "FAILED")
     }
     pub async fn open(&self) -> Result<ScreenSender,String> {
-        // 先发 catplay 原版（宝马已上车）。只有 400 才在同一条控制连接上换一套字段再试一次。
-        // 其它状态（断连、超时、非 400）不重试：连接已经不可用，再写只会拖到车机拆热点。
-        let kinds=[airplay::ScreenSetupKind::Canonical, airplay::ScreenSetupKind::AirTunes475];
+        // 宝马仍先发 catplay 原版，只有 400 才在同一条控制连接上换 airtunes475。
+        // 小鹏 G6 只发这一套 canonical，而且先等一条 timesync 应答。+xpeng2 的两套
+        // 报文体都已实车 400，当时 timing requests 仍是 0。非 400 不重试。
+        let kinds=airplay::screen_setup_order(self.params.screen_setup_xpeng3);
         let total=kinds.len();
         let mut first_400: Option<String>=None;
-        for (index, kind) in kinds.into_iter().enumerate() {
+        if !self.params.timing_wait.is_zero() {
+            let before=self.params.pipeline.lock().timing.clone();
+            crate::emit_log(&format!("TIMING: before screen SETUP wait {}", before.summary()));
+            let after=crate::timing::wait_for_reply(&self.params.pipeline, self.params.timing_wait).await;
+            crate::emit_log(&format!(
+                "TIMING: before screen SETUP replies={} {}",
+                after.replies, after.summary()
+            ));
+        }
+        for (index, kind) in kinds.iter().copied().enumerate() {
             let conn_id=airplay::random_positive_i64();
             let body=airplay::build_screen_setup_kind(conn_id,&self.uuid,kind);
             crate::emit_log(&format!(
-                "AIRPLAY: 屏幕 SETUP {} {}/{} body={}B connId={conn_id}",
-                kind.label(), index+1, total, body.len()
+                "AIRPLAY: 屏幕 SETUP {} {}/{} body={}B connId={conn_id} latencyMs={}",
+                kind.label(), index+1, total, body.len(), kind.latency_ms()
             ));
             let response=self.control.request("SETUP","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await?;
             if response.status()==400 && index+1<total {
@@ -48,8 +58,17 @@ impl ScreenSession {
                 continue;
             }
             if response.status()!=200 {
+                if response.status()==400 && index+1==total {
+                    crate::emit_log(&format!(
+                        "AIRPLAY: 屏幕 SETUP 400 setup={} [{}] responseBody={}B；同一连接不再发第二套",
+                        kind.label(), response.first_line, response.body.len()
+                    ));
+                }
                 let prior=first_400.map(|line| format!("首次[{line}]；")).unwrap_or_default();
-                return Err(format!("屏幕 SETUP 被拒 {prior}[{}]（uuid={}）", response.first_line, self.uuid));
+                return Err(format!(
+                    "屏幕 SETUP 被拒 setup={} {prior}[{}] responseBody={}B（uuid={}）",
+                    kind.label(), response.first_line, response.body.len(), self.uuid
+                ));
             }
             let root=bplist::parse(&response.body).map_err(|e|format!("屏幕 SETUP 解析失败 {e}"))?;
             let port=root.get("streams").and_then(Value::as_array).and_then(|s|s.first())
@@ -169,6 +188,7 @@ mod tests {
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),identity_path:"test".into(),
                 receiver_id:None,receiver_previously_connected:true,enable_audio:true,keep_alive_stats:false,
                 bmw_box_bootstrap:true,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
+                screen_setup_xpeng3:false,timing_wait:Duration::ZERO,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,ui_retake_recovery:false,screen_stream_recovery:true,pipeline:pipeline.clone(),
             };
@@ -222,6 +242,7 @@ mod tests {
             car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),identity_path:"test".into(),
             receiver_id:None,receiver_previously_connected:true,enable_audio:true,keep_alive_stats:false,
             bmw_box_bootstrap:true,desktop_receiver:false,width:2560,height:1236,touch_display:Some((1920,1080)),touch_rect:None,
+            screen_setup_xpeng3:false,timing_wait:Duration::ZERO,
             encoder_size:Arc::new(Mutex::new((2560,1236))),touch_size:Arc::new(Mutex::new((2560,1236))),
             carwith_display:None,carwith_stretch:false,ui_retake_recovery:false,screen_stream_recovery:true,pipeline,
         }
@@ -260,6 +281,7 @@ mod tests {
         assert_eq!(second_stream.get("latencyMs").and_then(Value::as_int),Some(70));
         assert_eq!(second_stream.get("uuid").and_then(Value::as_str),Some("E5F7A68D-7B0F-4305-984B-974F677A150B"));
         assert_eq!(second_stream.get("timestampInfo").unwrap().as_array().unwrap().len(),5);
+        assert!(second_stream.get("supportsHighAccuracyTimestamps").is_none());
         assert_ne!(
             first_stream.get("streamConnectionID").and_then(Value::as_int),
             second_stream.get("streamConnectionID").and_then(Value::as_int)
@@ -272,5 +294,99 @@ mod tests {
         assert_eq!(sender.size(),(2560,1236));
         drop(sender);
         let _=tokio::time::timeout(Duration::from_secs(2),video.accept()).await.unwrap();
+    }
+
+    fn xpeng_params(pipeline:Arc<Mutex<crate::pipeline::Pipeline>>)->AirplayParams {
+        let mut value=params(pipeline);
+        value.screen_setup_xpeng3=true;
+        value
+    }
+
+    #[tokio::test]
+    async fn xpeng3_screen_setup_is_first_and_keeps_native_size() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car,_)=listener.accept().await.unwrap();
+        let (r,w)=phone.into_split();let (control,_)=RtspChannel::spawn(r,w,None);
+        let video=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port=video.local_addr().unwrap().port() as i64;
+        let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let (commands,_rx)=mpsc::channel(1);
+        let session=ScreenSession {
+            control:control.clone(),factory:Arc::new(Factory),params:xpeng_params(pipeline),
+            shared:Some([9;32]),uuid:"e5f7a68d-7b0f-4305-984b-974f677a150b".into(),keep_stats:false,
+            display:(2560,1236),owned:Arc::new(AtomicBool::new(true)),commands,initialized:AtomicBool::new(false),
+        };
+        let opening=tokio::spawn(async move { session.open().await });
+        let setup=read(&mut car).await;
+        assert!(setup.first_line.starts_with("SETUP / "));
+        let root=bplist::parse(&setup.body).unwrap();
+        let stream=&root.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("type").and_then(Value::as_int),Some(110));
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int),Some(25));
+        assert_eq!(stream.get("uuid").and_then(Value::as_str),Some("e5f7a68d-7b0f-4305-984b-974f677a150b"));
+        assert!(stream.get("timestampInfo").is_none());
+        assert!(stream.get("supportsHighAccuracyTimestamps").is_none());
+        assert!(stream.get("widthPixels").is_none() && stream.get("heightPixels").is_none());
+        let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
+            ("type",Value::int(110)),("dataPort",Value::int(port)),
+        ])]))]));
+        reply(&mut car,&setup,&body).await;
+        let sender=opening.await.unwrap().unwrap();
+        assert_eq!(sender.size(),(2560,1236));
+        drop(sender);
+        let _=tokio::time::timeout(Duration::from_secs(2),video.accept()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn xpeng3_screen_setup_does_not_retry_after_400() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car,_)=listener.accept().await.unwrap();
+        let (r,w)=phone.into_split();let (control,_)=RtspChannel::spawn(r,w,None);
+        let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let (commands,_rx)=mpsc::channel(1);
+        let session=ScreenSession {
+            control:control.clone(),factory:Arc::new(Factory),params:xpeng_params(pipeline),
+            shared:Some([9;32]),uuid:"e5f7a68d-7b0f-4305-984b-974f677a150b".into(),keep_stats:false,
+            display:(2560,1236),owned:Arc::new(AtomicBool::new(true)),commands,initialized:AtomicBool::new(false),
+        };
+        let opening=tokio::spawn(async move { session.open().await });
+        let setup=read(&mut car).await;
+        let root=bplist::parse(&setup.body).unwrap();
+        let stream=&root.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int), Some(25));
+        assert!(stream.get("timestampInfo").is_none());
+        reply_status(&mut car,&setup,"400 Bad Request",&[]).await;
+        let error=match opening.await.unwrap() { Err(error)=>error, Ok(_)=>panic!("xpeng3 SETUP 400 must fail") };
+        assert!(error.contains("setup=canonical"), "{error}");
+        assert!(error.contains("400"), "{error}");
+        assert!(tokio::time::timeout(Duration::from_millis(400), read(&mut car)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn xpeng3_holds_canonical_setup_until_the_first_timing_reply() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car,_)=listener.accept().await.unwrap();
+        let (r,w)=phone.into_split();let (control,_)=RtspChannel::spawn(r,w,None);
+        let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let (commands,_rx)=mpsc::channel(1);
+        let mut params=xpeng_params(pipeline.clone());
+        params.timing_wait=Duration::from_millis(800);
+        let session=ScreenSession {
+            control,factory:Arc::new(Factory),params,shared:Some([9;32]),
+            uuid:"e5f7a68d-7b0f-4305-984b-974f677a150b".into(),keep_stats:false,
+            display:(2560,1236),owned:Arc::new(AtomicBool::new(true)),commands,initialized:AtomicBool::new(false),
+        };
+        let opening=tokio::spawn(async move { session.open().await });
+        assert!(tokio::time::timeout(Duration::from_millis(200), read(&mut car)).await.is_err());
+        pipeline.lock().timing.replies=1;
+        let setup=read(&mut car).await;
+        assert_eq!(bplist::parse(&setup.body).unwrap().get("streams").unwrap().as_array().unwrap()[0]
+            .get("latencyMs").and_then(Value::as_int), Some(25));
+        reply_status(&mut car,&setup,"400 Bad Request",&[]).await;
+        let error=match opening.await.unwrap() { Err(error)=>error, Ok(_)=>panic!("expected 400") };
+        assert!(error.contains("setup=canonical"), "{error}");
     }
 }

@@ -194,11 +194,13 @@ object HeadUnitProfiles {
     /**
      * 小鹏 G6 海外 2025（XMARTQIIAF30E5）—— **未实车验证**（据海外 G6 诊断起草）。
      *
-     * 无线档案 B 已能 pair-verify、会话 SETUP、RECORD。屏幕流 SETUP 的 canonical 体
-     * （type=110、latencyMs=25、原样 uuid）在 AirTunes/475.8.3 上曾回 400。Rust 在同一条
-     * 控制连接上再试一次：latencyMs=70、UUID 大写、补 timestampInfo，仍是 H.264 type 110，
-     * 不降分辨率。本档案只改手机侧 iAP2 策略：不发 0x4E0E / EA、不断 HFP/A2DP、
-     * 不做主动出站、不等 ctrl 邀请。`touchDisplay` 留空，触摸只用 /info 坐标。
+     * 无线档案 B 已能 pair-verify、会话 SETUP、RECORD。+xpeng2 的两套屏幕 SETUP
+     * 报文体（canonical 167B 与 airtunes475 276B）在实车都是 400，当时计时
+     * `requests=0`，控制地址是 IPv6 链路本地。选中 id `xpeng_g6` 时 Rust 把计时口
+     * 绑到 IPv6，最多等 1.5s 第一条 timesync 应答，然后只发一次 catplay 原版
+     * type 110。不改分辨率，也不再换报文体。
+     * 本档案的 iAP2 策略：不发 0x4E0E / EA、不断 HFP/A2DP、不做主动出站、不等 ctrl 邀请。
+     * `touchDisplay` 留空，触摸只用 /info 坐标。
      */
     val XPENG_G6 = HeadUnitProfile(
         id = "xpeng_g6",
@@ -207,8 +209,8 @@ object HeadUnitProfiles {
         notes = "未实车验证（据海外 G6 诊断起草）。无线档案 B：车机发 0x4301、不发 0x5703、" +
             "可收仅 0x4155/0x4300/0x4e09/0x4e0b/0x4e0c。关闭 0x4E0E/EA、关闭断 HFP/A2DP 与主动出站" +
             "（日志里断 HFP 会拆 RFCOMM）、不要求 ctrl 邀请。touchDisplay 留空=只用 /info 触摸坐标，" +
-            "不改编码分辨率/画质。屏幕 SETUP 仍先发 catplay 原版（latencyMs=25）；若 400，Rust 在同一连接" +
-            "改试 latencyMs=70、UUID 大写、timestampInfo，type 保持 110。档案字段改不了这套报文体。",
+            "不改编码分辨率/画质。选中本档案时计时口走 IPv6，屏幕 SETUP 等到第一条 timesync " +
+            "应答（最多 1.5s）后只发一次 catplay 原版 type 110。+xpeng2 的两套报文体都不再重试。",
         verified = false,
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
@@ -225,6 +227,12 @@ object HeadUnitProfiles {
         pairingHint = "车机弹出 CarPlay 授权后点接受；保持蓝牙 HFP 勿被系统/其它 App 强断；" +
             "热点加入后等约 3–5 秒再重试；分辨率/帧率在设置「画面」里自定，本档案不降画质。",
     )
+
+    /**
+     * 计时口和屏幕 SETUP 是否等待 timesync，由档案 id 决定，不读 JSON 策略字段。
+     * 远程档案只要 id 仍是 [XPENG_G6]，就走这条路径；其它 id 保持宝马顺序。
+     */
+    fun usesXpeng3ScreenSetup(profileId: String?): Boolean = profileId == XPENG_G6.id
 
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
     val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3, XPENG_G6)

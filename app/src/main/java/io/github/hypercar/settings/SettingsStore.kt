@@ -362,6 +362,9 @@ object SettingsStore {
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
             append("\"ui_retake_recovery\":").append(if (uiRetakeRecovery) "true" else "false").append(",")
             append("\"screen_stream_recovery\":").append(if (screenStreamRecovery) "true" else "false").append(",")
+            append("\"screen_setup_xpeng3\":").append(
+                io.github.hypercar.headunit.HeadUnitProfiles.usesXpeng3ScreenSetup(headUnitProfileId)
+            ).append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")
             append("\"touch_display_w\":").append(tdW).append(",")
