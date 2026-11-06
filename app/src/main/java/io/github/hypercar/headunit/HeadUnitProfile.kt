@@ -194,11 +194,11 @@ object HeadUnitProfiles {
     /**
      * 小鹏 G6 海外 2025（XMARTQIIAF30E5）—— **未实车验证**（据海外 G6 诊断起草）。
      *
-     * 无线档案 B 已能 pair-verify、会话 SETUP、RECORD。屏幕流 SETUP 的报文体不由
-     * 本档案的 JSON 字段决定：选中 id `xpeng_g6` 时引擎配置带 `screen_setup_xpeng3`，
-     * Rust 在这条控制连接上第一发 type 110 就用 xpeng3（latencyMs=70、/info 原文 uuid、
-     * timestampInfo、supportsHighAccuracyTimestamps）。仍是 H.264，不降分辨率。
-     * +xpeng2 的 canonical 与「400 后再试大写 UUID」都不再发给这台车。
+     * 无线档案 B 已能 pair-verify、会话 SETUP、RECORD。+xpeng2 的两套屏幕 SETUP
+     * 报文体（canonical 167B 与 airtunes475 276B）在实车都是 400，当时计时
+     * `requests=0`，控制地址是 IPv6 链路本地。选中 id `xpeng_g6` 时 Rust 把计时口
+     * 绑到 IPv6，最多等 1.5s 第一条 timesync 应答，然后只发一次 catplay 原版
+     * type 110。不改分辨率，也不再换报文体。
      * 本档案的 iAP2 策略：不发 0x4E0E / EA、不断 HFP/A2DP、不做主动出站、不等 ctrl 邀请。
      * `touchDisplay` 留空，触摸只用 /info 坐标。
      */
@@ -209,9 +209,8 @@ object HeadUnitProfiles {
         notes = "未实车验证（据海外 G6 诊断起草）。无线档案 B：车机发 0x4301、不发 0x5703、" +
             "可收仅 0x4155/0x4300/0x4e09/0x4e0b/0x4e0c。关闭 0x4E0E/EA、关闭断 HFP/A2DP 与主动出站" +
             "（日志里断 HFP 会拆 RFCOMM）、不要求 ctrl 邀请。touchDisplay 留空=只用 /info 触摸坐标，" +
-            "不改编码分辨率/画质。选中本档案时 Rust 第一发屏幕 SETUP 用 xpeng3（type 110、" +
-            "latencyMs=70、/info 原文 uuid、timestampInfo、supportsHighAccuracyTimestamps），" +
-            "400 后不再在同一连接重试。档案 JSON 改不了这套报文体。",
+            "不改编码分辨率/画质。选中本档案时计时口走 IPv6，屏幕 SETUP 等到第一条 timesync " +
+            "应答（最多 1.5s）后只发一次 catplay 原版 type 110。+xpeng2 的两套报文体都不再重试。",
         verified = false,
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
@@ -230,8 +229,8 @@ object HeadUnitProfiles {
     )
 
     /**
-     * 屏幕 SETUP 体由档案 id 选择，不读 JSON 策略字段。远程档案只要 id 仍是
-     * [XPENG_G6]，就会走 xpeng3；其它 id 保持宝马那套 canonical。
+     * 计时口和屏幕 SETUP 是否等待 timesync，由档案 id 决定，不读 JSON 策略字段。
+     * 远程档案只要 id 仍是 [XPENG_G6]，就走这条路径；其它 id 保持宝马顺序。
      */
     fun usesXpeng3ScreenSetup(profileId: String?): Boolean = profileId == XPENG_G6.id
 

@@ -65,9 +65,11 @@ pub struct AirplayParams {
     pub carwith_stretch: bool,
     pub ui_retake_recovery: bool,
     pub screen_stream_recovery: bool,
-    /// 小鹏 G6（AirTunes/475.8.3）：第一发屏幕 SETUP 用 [ScreenSetupKind::Xpeng3]，
-    /// 不先发已被 400 的 canonical，也不在同一连接上再试。其它车机保持原顺序。
+    /// 小鹏 G6：屏幕 SETUP 只发 catplay 原版一次，并先等计时应答。
+    /// +xpeng2 的 canonical 与 airtunes475 都已在实车 400；不再换报文体。
     pub screen_setup_xpeng3: bool,
+    /// 发屏幕 SETUP 前等待第一条 timesync 应答的上限。零表示不等。
+    pub timing_wait: Duration,
     pub pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
 }
 
@@ -252,7 +254,7 @@ pub async fn negotiate(
     if box_bootstrap { crate::auth_setup::run(&channel).await?; }
 
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
-    let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
+    let timing = TimingServer::start_for_car(p.pipeline.clone(), &p.car_ip).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
         &channel, &p.device_id, timing.port, shared_secret.is_some(), info,
     ).await?;
@@ -621,31 +623,21 @@ mod display_size_tests {
     }
 
     #[test]
-    fn xpeng3_screen_setup_is_a_new_shape_and_does_not_touch_resolution() {
-        let uuid = "e5f7a68d-7b0f-4305-984b-974f677a150b";
-        let body = bplist::parse(&build_screen_setup_kind(7, uuid, ScreenSetupKind::Xpeng3)).unwrap();
-        let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
-        assert_eq!(stream.get("type").and_then(Value::as_int), Some(110));
-        assert_eq!(stream.get("streamConnectionID").and_then(Value::as_int), Some(7));
-        assert_eq!(stream.get("latencyMs").and_then(Value::as_int), Some(70));
-        assert_eq!(stream.get("uuid").and_then(Value::as_str), Some(uuid));
-        assert_eq!(stream.get("supportsHighAccuracyTimestamps").and_then(Value::as_bool), Some(true));
-        let names: Vec<_> = stream.get("timestampInfo").unwrap().as_array().unwrap().iter()
-            .map(|entry| entry.get("name").and_then(Value::as_str).unwrap().to_string())
-            .collect();
-        assert_eq!(names, vec!["SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc"]);
-        assert!(stream.get("widthPixels").is_none() && stream.get("heightPixels").is_none());
-        assert!(stream.get("fps").is_none());
-        let canonical = build_screen_setup_kind(7, uuid, ScreenSetupKind::Canonical);
-        let prior = build_screen_setup_kind(7, uuid, ScreenSetupKind::AirTunes475);
-        let xpeng3 = build_screen_setup_kind(7, uuid, ScreenSetupKind::Xpeng3);
-        assert_ne!(xpeng3, canonical);
-        assert_ne!(xpeng3, prior);
+    fn xpeng3_sends_only_the_canonical_body() {
         assert_eq!(
             screen_setup_order(false),
             [ScreenSetupKind::Canonical, ScreenSetupKind::AirTunes475].as_slice()
         );
-        assert_eq!(screen_setup_order(true), [ScreenSetupKind::Xpeng3].as_slice());
+        assert_eq!(screen_setup_order(true), [ScreenSetupKind::Canonical].as_slice());
+        let uuid = "e5f7a68d-7b0f-4305-984b-974f677a150b";
+        let body = bplist::parse(&build_screen_setup_kind(7, uuid, screen_setup_order(true)[0])).unwrap();
+        let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("type").and_then(Value::as_int), Some(110));
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int), Some(25));
+        assert_eq!(stream.get("uuid").and_then(Value::as_str), Some(uuid));
+        assert!(stream.get("timestampInfo").is_none());
+        assert!(stream.get("supportsHighAccuracyTimestamps").is_none());
+        assert!(stream.get("widthPixels").is_none() && stream.get("heightPixels").is_none());
     }
 
     #[test]
@@ -1142,25 +1134,14 @@ async fn setup_and_read_info(
 ///
 /// [Canonical] 与 catplay `StreamDescriptionScreen` 相同：`type=110`、`streamConnectionID`、
 /// `/info` 原样 uuid、`latencyMs=25`。宝马 / Mazda AirTunes 320 接受这约 167B 的体。
-/// 非小鹏路径仍先发它；只有 400 才在同一连接上发 [AirTunes475]。那套是 +xpeng2 的实验，
-/// G6 上仍 400，而且只出现在第一次 400 之后，不能当成干净样本。
+/// 非小鹏路径仍先发它；只有 400 才在同一连接上发 [AirTunes475]。
 ///
-/// [Xpeng3] 只给小鹏 G6，并且是这条控制连接上的**第一发** type 110（不再先发已被拒的体）。
-/// 与两套失败体都不同：
-///  - uuid 用 `/info` 原文，不转成 `CFUUIDCreateString` 大写。475 用自己写出的字符串做显示查找；
-///    日志里是小写 `e5f7a68d-7b0f-4305-984b-974f677a150b`，大小写敏感时大写对不上，直接空体 400。
-///  - `latencyMs=70`。25 低于 catplay 音频通路记下的 32ms 下限；320 不卡这道，475 可以。
-///    70ms 只是流延迟声明，不改分辨率、码率或 H.264。
-///  - `timestampInfo` 五个阶段名（SubSu/BePxT/AfPxT/BefEn/EmEnc）。320 不要求；更新的插件缺了会 400。
-///    +xpeng2 把这组名字和「UUID 大写」绑在同一次重试里，分不出是哪一项被拒。
-///  - `supportsHighAccuracyTimestamps=true`。catplay 把它标成 Modern CarPlay，airplay-rs 的 type 110
-///    也会带。两套失败体都没有。视频头里本来就写 NTP 时间戳，这个标志只声明已有行为。
-/// 不含宽高、fps，也不把 type 改成 111。
+/// 小鹏 G6 的 +xpeng2 实车日志里这两套都是 400（167B 与 276B），而且当时
+/// `TIMING requests=0`。+xpeng3 不再改这套报文体，也不再在 400 后重试。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScreenSetupKind {
     Canonical,
     AirTunes475,
-    Xpeng3,
 }
 
 impl ScreenSetupKind {
@@ -1168,22 +1149,21 @@ impl ScreenSetupKind {
         match self {
             Self::Canonical => "canonical",
             Self::AirTunes475 => "airtunes475",
-            Self::Xpeng3 => "xpeng3",
         }
     }
 
     pub(crate) fn latency_ms(self) -> i64 {
         match self {
             Self::Canonical => 25,
-            Self::AirTunes475 | Self::Xpeng3 => 70,
+            Self::AirTunes475 => 70,
         }
     }
 }
 
-/// 小鹏 G6 只发 [ScreenSetupKind::Xpeng3]。其它车机仍是 canonical，400 后再试 airtunes475。
+/// 小鹏 G6 只发 canonical 一次。其它车机仍是 canonical，400 后再试 airtunes475。
 pub(crate) fn screen_setup_order(xpeng3: bool) -> &'static [ScreenSetupKind] {
     if xpeng3 {
-        &[ScreenSetupKind::Xpeng3]
+        &[ScreenSetupKind::Canonical]
     } else {
         &[ScreenSetupKind::Canonical, ScreenSetupKind::AirTunes475]
     }
@@ -1197,7 +1177,7 @@ pub(crate) fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {
 
 pub(crate) fn build_screen_setup_kind(conn_id: i64, uuid: &str, kind: ScreenSetupKind) -> Vec<u8> {
     let shown = match kind {
-        ScreenSetupKind::Canonical | ScreenSetupKind::Xpeng3 => uuid.to_string(),
+        ScreenSetupKind::Canonical => uuid.to_string(),
         ScreenSetupKind::AirTunes475 => apple_cfuuid(uuid),
     };
     let mut fields = vec![
@@ -1206,11 +1186,7 @@ pub(crate) fn build_screen_setup_kind(conn_id: i64, uuid: &str, kind: ScreenSetu
         ("uuid", Value::str(&shown)),
         ("latencyMs", Value::int(kind.latency_ms())),
     ];
-    if kind == ScreenSetupKind::Xpeng3 {
-        // 声明视频头里已有的 NTP 时间戳。不改编码。
-        fields.push(("supportsHighAccuracyTimestamps", Value::bool(true)));
-    }
-    if kind == ScreenSetupKind::AirTunes475 || kind == ScreenSetupKind::Xpeng3 {
+    if kind == ScreenSetupKind::AirTunes475 {
         fields.push((
             "timestampInfo",
             Value::array(

@@ -432,6 +432,8 @@ pub async fn run_engine(
         ui_retake_recovery: cfg.ui_retake_recovery,
         screen_stream_recovery: cfg.screen_stream_recovery,
         screen_setup_xpeng3: cfg.screen_setup_xpeng3,
+        // 2026-11-05 G6 日志：屏幕 SETUP 时 timing requests 仍为 0。先等一条应答。
+        timing_wait: if cfg.screen_setup_xpeng3 { Duration::from_millis(1500) } else { Duration::ZERO },
         pipeline: pipeline.clone(),
     };
     let outcome = tokio::select! {

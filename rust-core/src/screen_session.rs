@@ -27,16 +27,18 @@ impl ScreenSession {
     }
     pub async fn open(&self) -> Result<ScreenSender,String> {
         // 宝马仍先发 catplay 原版，只有 400 才在同一条控制连接上换 airtunes475。
-        // 小鹏 G6 只发 xpeng3，而且是第一发：+xpeng2 的第二套发生在 400 之后，
-        // 车机可能已经占住 type 110（catplay 对未 TEARDOWN 的第二发直接 400）。
-        // 其它状态（断连、超时、非 400）不重试。
+        // 小鹏 G6 只发这一套 canonical，而且先等一条 timesync 应答。+xpeng2 的两套
+        // 报文体都已实车 400，当时 timing requests 仍是 0。非 400 不重试。
         let kinds=airplay::screen_setup_order(self.params.screen_setup_xpeng3);
         let total=kinds.len();
         let mut first_400: Option<String>=None;
-        if self.params.screen_setup_xpeng3 {
+        if !self.params.timing_wait.is_zero() {
+            let before=self.params.pipeline.lock().timing.clone();
+            crate::emit_log(&format!("TIMING: before screen SETUP wait {}", before.summary()));
+            let after=crate::timing::wait_for_reply(&self.params.pipeline, self.params.timing_wait).await;
             crate::emit_log(&format!(
-                "TIMING: before screen SETUP {}",
-                self.params.pipeline.lock().timing.summary()
+                "TIMING: before screen SETUP replies={} {}",
+                after.replies, after.summary()
             ));
         }
         for (index, kind) in kinds.iter().copied().enumerate() {
@@ -186,7 +188,7 @@ mod tests {
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),identity_path:"test".into(),
                 receiver_id:None,receiver_previously_connected:true,enable_audio:true,keep_alive_stats:false,
                 bmw_box_bootstrap:true,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
-                screen_setup_xpeng3:false,
+                screen_setup_xpeng3:false,timing_wait:Duration::ZERO,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,ui_retake_recovery:false,screen_stream_recovery:true,pipeline:pipeline.clone(),
             };
@@ -240,7 +242,7 @@ mod tests {
             car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),identity_path:"test".into(),
             receiver_id:None,receiver_previously_connected:true,enable_audio:true,keep_alive_stats:false,
             bmw_box_bootstrap:true,desktop_receiver:false,width:2560,height:1236,touch_display:Some((1920,1080)),touch_rect:None,
-            screen_setup_xpeng3:false,
+            screen_setup_xpeng3:false,timing_wait:Duration::ZERO,
             encoder_size:Arc::new(Mutex::new((2560,1236))),touch_size:Arc::new(Mutex::new((2560,1236))),
             carwith_display:None,carwith_stretch:false,ui_retake_recovery:false,screen_stream_recovery:true,pipeline,
         }
@@ -321,10 +323,10 @@ mod tests {
         let root=bplist::parse(&setup.body).unwrap();
         let stream=&root.get("streams").unwrap().as_array().unwrap()[0];
         assert_eq!(stream.get("type").and_then(Value::as_int),Some(110));
-        assert_eq!(stream.get("latencyMs").and_then(Value::as_int),Some(70));
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int),Some(25));
         assert_eq!(stream.get("uuid").and_then(Value::as_str),Some("e5f7a68d-7b0f-4305-984b-974f677a150b"));
-        assert_eq!(stream.get("supportsHighAccuracyTimestamps").and_then(Value::as_bool),Some(true));
-        assert_eq!(stream.get("timestampInfo").unwrap().as_array().unwrap().len(),5);
+        assert!(stream.get("timestampInfo").is_none());
+        assert!(stream.get("supportsHighAccuracyTimestamps").is_none());
         assert!(stream.get("widthPixels").is_none() && stream.get("heightPixels").is_none());
         let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
             ("type",Value::int(110)),("dataPort",Value::int(port)),
@@ -351,12 +353,40 @@ mod tests {
         };
         let opening=tokio::spawn(async move { session.open().await });
         let setup=read(&mut car).await;
-        assert_eq!(bplist::parse(&setup.body).unwrap().get("streams").unwrap().as_array().unwrap()[0]
-            .get("supportsHighAccuracyTimestamps").and_then(Value::as_bool), Some(true));
+        let root=bplist::parse(&setup.body).unwrap();
+        let stream=&root.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("latencyMs").and_then(Value::as_int), Some(25));
+        assert!(stream.get("timestampInfo").is_none());
         reply_status(&mut car,&setup,"400 Bad Request",&[]).await;
         let error=match opening.await.unwrap() { Err(error)=>error, Ok(_)=>panic!("xpeng3 SETUP 400 must fail") };
-        assert!(error.contains("setup=xpeng3"), "{error}");
+        assert!(error.contains("setup=canonical"), "{error}");
         assert!(error.contains("400"), "{error}");
         assert!(tokio::time::timeout(Duration::from_millis(400), read(&mut car)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn xpeng3_holds_canonical_setup_until_the_first_timing_reply() {
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car,_)=listener.accept().await.unwrap();
+        let (r,w)=phone.into_split();let (control,_)=RtspChannel::spawn(r,w,None);
+        let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let (commands,_rx)=mpsc::channel(1);
+        let mut params=xpeng_params(pipeline.clone());
+        params.timing_wait=Duration::from_millis(800);
+        let session=ScreenSession {
+            control,factory:Arc::new(Factory),params,shared:Some([9;32]),
+            uuid:"e5f7a68d-7b0f-4305-984b-974f677a150b".into(),keep_stats:false,
+            display:(2560,1236),owned:Arc::new(AtomicBool::new(true)),commands,initialized:AtomicBool::new(false),
+        };
+        let opening=tokio::spawn(async move { session.open().await });
+        assert!(tokio::time::timeout(Duration::from_millis(200), read(&mut car)).await.is_err());
+        pipeline.lock().timing.replies=1;
+        let setup=read(&mut car).await;
+        assert_eq!(bplist::parse(&setup.body).unwrap().get("streams").unwrap().as_array().unwrap()[0]
+            .get("latencyMs").and_then(Value::as_int), Some(25));
+        reply_status(&mut car,&setup,"400 Bad Request",&[]).await;
+        let error=match opening.await.unwrap() { Err(error)=>error, Ok(_)=>panic!("expected 400") };
+        assert!(error.contains("setup=canonical"), "{error}");
     }
 }

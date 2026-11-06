@@ -86,7 +86,7 @@
       "id": "xpeng_g6",
       "label": "小鹏 G6（海外）",
       "model": "XPENG G6 overseas 2025 / XMARTQIIAF30E5",
-      "notes": "未实车验证（据海外 G6 诊断起草）。无线档案 B：车机发 0x4301、不发 0x5703、可收仅 0x4155/0x4300/0x4e09/0x4e0b/0x4e0c。关闭 0x4E0E/EA、关闭断 HFP/A2DP 与主动出站（日志里断 HFP 会拆 RFCOMM）、不要求 ctrl 邀请。touchDisplay 留空=只用 /info 触摸坐标，不改编码分辨率/画质。选中 id xpeng_g6 时 Rust 第一发屏幕 SETUP 用 xpeng3（type=110、latencyMs=70、/info 原文 uuid、timestampInfo、supportsHighAccuracyTimestamps），400 后不再在同一连接重试。档案 JSON 字段改不了这套报文体。",
+      "notes": "未实车验证（据海外 G6 诊断起草）。无线档案 B：车机发 0x4301、不发 0x5703、可收仅 0x4155/0x4300/0x4e09/0x4e0b/0x4e0c。关闭 0x4E0E/EA、关闭断 HFP/A2DP 与主动出站（日志里断 HFP 会拆 RFCOMM）、不要求 ctrl 邀请。touchDisplay 留空=只用 /info 触摸坐标，不改编码分辨率/画质。+xpeng2 实车日志里 canonical 与 airtunes475 都是 SETUP 400，且 timing requests=0、控制地址是 IPv6。选中本 id 时计时口绑 [::]，屏幕 SETUP 等到第一条 timesync 应答后只发一次 catplay 原版。档案 JSON 字段改不了这套行为。",
       "verified": false,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
