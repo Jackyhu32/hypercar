@@ -1283,10 +1283,12 @@ async fn negotiate_audio(
     } else {
         None
     };
+    let audio = AudioOut::new(udp, sync, key, 100);
+    emit_log(&audio.prioritize_over_video());
     emit_log(&format!(
         "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（PCM48k/SPF352）"
     ));
-    Some(AudioOut::new(udp, sync, key, 100))
+    Some(audio)
 }
 
 // ---------------------------------------------------------------- 心跳

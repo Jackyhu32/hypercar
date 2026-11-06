@@ -219,10 +219,13 @@ pub async fn run_engine(
     }
 
     // ---- 视频泵 ----
+    // 音频泵与视频泵共享这一份提示：大帧在音频发包落后或媒体队列见底时让一下路。
+    // 不改分辨率、码率或屏幕 SETUP。
+    let audio_link = Arc::new(crate::audio_priority::AudioLink::new());
     let (screen_ready_tx, screen_ready_rx) = mpsc::channel::<crate::screen_session::ScreenCommand>(2);
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     tasks.spawn(video_pump(stop.clone(), video_stats.clone(), cfg.screen_stream_recovery,
-        pipeline.clone(), screen_ready_rx, video_rx));
+        audio_link.clone(), pipeline.clone(), screen_ready_rx, video_rx));
 
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
     let (audio_out_tx, audio_out_rx) = tokio::sync::oneshot::channel::<AudioOut>();
@@ -230,7 +233,9 @@ pub async fn run_engine(
     {
         let stop_a = stop.clone();
         let stats = audio_stats.clone();
+        let audio_link = audio_link.clone();
         tasks.spawn(async move {
+            emit_log(&crate::audio_priority::media_buffer_banner());
             let mut out: Option<AudioOut> = None;
             let mut ready = Some(audio_out_rx);
             let mut audio_rx = audio_rx;
@@ -252,7 +257,7 @@ pub async fn run_engine(
     // 我们这里是「收 PCM → 自己重排节奏」，所以必须用绝对时刻对齐：
             //  - Burst：漏掉的拍**立刻补发**（Delay 会永久丢拍 → RTP 时钟持续落后于
             //    墙钟，接收端表现为 late/discontinuity 一直涨、听感断续）。
-            //  - 补发仍受混音队列上限（~0.5s）约束，不会无限喷包。
+            //  - 补发仍受混音队列上限（媒体 2s，提示音 0.5s）约束，不会无限喷包。
             // 现场 2026-10-23 23:45：WinPlay 侧统计 packets 只有 ~68/s（应为 48000/352≈136/s），
             // 正好少一半，印证漏拍。
             let mut tick =
@@ -263,6 +268,13 @@ pub async fn run_engine(
             // 发包速率自测：每秒记一行，联调时能直接看出节拍对不对。
             let mut sent_packets: u64 = 0;
             let mut audio_errors: u64 = 0;
+            let mut media_dropped: usize = 0;
+            let mut media_primed = false;
+            let mut ticks_seen: u64 = 0;
+            let mut last_tick_at = std::time::Instant::now();
+            let mut behind_until = std::time::Instant::now();
+            let mut held_lag = Duration::ZERO;
+            let packet_period = Duration::from_nanos((SPF as u64) * 1_000_000_000 / TARGET_RATE as u64);
             let mut rate_mark = std::time::Instant::now();
             let mut mixed = vec![0i16; SPF * 2];
             loop {
@@ -284,7 +296,14 @@ pub async fn run_engine(
                             stats.lock().playing = true;
                         }
                         Some(SourceEvent::AudioStop { tts }) => {
-                            if tts { tts_mix.clear(); } else { media_mix.clear(); last_audio_at = None; }
+                            if tts {
+                                tts_mix.clear();
+                            } else {
+                                media_mix.clear();
+                                media_primed = false;
+                                last_audio_at = None;
+                                emit_log("AUDIO: 媒体预缓冲已复位");
+                            }
                         }
                         Some(SourceEvent::AudioData { tts, rate, channels, data }) => {
                             let (fmt, remain, mix) = if tts {
@@ -301,9 +320,15 @@ pub async fn run_engine(
                                 last_audio_at = Some(std::time::Instant::now());
                             }
                             push_resampled(&data, fmt.0, fmt.1, remain, mix);
-                            // 缓冲上限 ~0.5s：过载丢旧（导航长语音不至于拖垮媒体）
-                            let cap = (TARGET_RATE as usize) * 2 / 2;
-                            while mix.len() > cap { mix.pop_front(); }
+                            // 媒体上限 2s：SoftAP 堵住时把 PCM 留在手机上，而不是 0.5s 就丢。
+                            // 提示音仍是 0.5s，长导航语音继续丢旧样本，不把媒体挤掉。
+                            let cap = crate::audio_priority::samples_for_ms(if tts {
+                                crate::audio_priority::TTS_CAP_MS
+                            } else {
+                                crate::audio_priority::MEDIA_CAP_MS
+                            });
+                            let dropped = crate::audio_priority::trim_oldest(mix, cap);
+                            if !tts { media_dropped += dropped; }
                         }
                         Some(_) => {}
                         None => return,
@@ -326,12 +351,36 @@ pub async fn run_engine(
                         let target = if duck_hold > 0 { 0.25f32 } else { 1.0f32 };
                         gain += (target - gain) * 0.15;
 
+                        let now = std::time::Instant::now();
+                        let gap = now.saturating_duration_since(last_tick_at);
+                        last_tick_at = now;
+                        ticks_seen = ticks_seen.saturating_add(1);
+                        // 第一拍的间隔含协商时间，不算落后。之后漏掉两包以上就进入短恢复窗。
+                        if ticks_seen > 1 && gap > packet_period * 2 {
+                            behind_until = now + Duration::from_millis(80);
+                            held_lag = gap;
+                        }
+                        // 预缓冲未满时仍按 136/s 发静音，RTP 时钟不停；满了才抽真实媒体。
+                        let drain_media = crate::audio_priority::media_drain_real(media_primed, media_mix.len());
+                        if drain_media && !media_primed && !media_mix.is_empty() {
+                            media_primed = true;
+                            emit_log(&format!(
+                                "AUDIO: 媒体预缓冲到达 {}ms（上限 {}ms，原先 {}ms）",
+                                crate::audio_priority::queue_ms(media_mix.len()),
+                                crate::audio_priority::MEDIA_CAP_MS,
+                                crate::audio_priority::MEDIA_CAP_WAS_MS
+                            ));
+                        }
+
                         for i in 0..SPF {
                             // 混音队列里是**交错立体声**（push_resampled 每帧压 L、R 两个样本）。
                             // 之前每帧只取一个样本再左右都填它——只消费了一半数据、还把立体声
                             // 压成单声道，听感就是沙沙声 + 断续（现场 2026-10-23 23:10 定位）。
-                            let ml = take_or_zero(&mut media_mix);
-                            let mr = take_or_zero(&mut media_mix);
+                            let (ml, mr) = if drain_media {
+                                (take_or_zero(&mut media_mix), take_or_zero(&mut media_mix))
+                            } else {
+                                (0, 0)
+                            };
                             let tl = take_or_zero(&mut tts_mix);
                             let tr = take_or_zero(&mut tts_mix);
                             let l = (ml as f32 * gain) as i32 + tl as i32;
@@ -343,9 +392,15 @@ pub async fn run_engine(
                         if let Some(a) = out.as_mut() {
                             // 静音时也发包：保持 RTP 时钟连续（车机按包排播）
                             let before = a.packets_sent();
+                            let send_started = std::time::Instant::now();
                             if let Err(error)=a.send_pcm(&mixed).await {
                                 audio_errors+=1;
                                 if audio_errors==1 || audio_errors%100==0 { emit_log(&format!("AUDIO: RTP write failed count={audio_errors}: {error}")); }
+                            }
+                            let send_cost = send_started.elapsed();
+                            if send_cost > packet_period * 2 {
+                                behind_until = std::time::Instant::now() + Duration::from_millis(80);
+                                held_lag = held_lag.max(send_cost);
                             }
                             let written=a.packets_sent().saturating_sub(before);
                             sent_packets += written;
@@ -353,18 +408,32 @@ pub async fn run_engine(
                             counters.packets += written;
                             if mixed.iter().any(|s| *s != 0) { counters.signal_packets += written; }
                         }
+                        // 恢复窗内保持「落后」标志，让大视频帧把信道让给正在补发的 RTP。
+                        let send_lag = if std::time::Instant::now() < behind_until {
+                            held_lag.max(packet_period * 2)
+                        } else {
+                            held_lag = Duration::ZERO;
+                            Duration::ZERO
+                        };
+                        let playing = stats.lock().playing;
+                        audio_link.publish(playing, media_primed, media_mix.len(), send_lag);
                         // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
                         // 接收端会表现为 late/discontinuity 增长、听感断续。
                         if rate_mark.elapsed() >= Duration::from_secs(1) {
                             let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                             emit_log(&format!(
-                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms",
+                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms cap={}ms prebuffer={} lag_us={} dropped_ms={}",
                                 sent_packets as f64 / secs,
                                 TARGET_RATE as f64 / SPF as f64,
-                                media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
-                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2
+                                crate::audio_priority::queue_ms(media_mix.len()),
+                                crate::audio_priority::queue_ms(tts_mix.len()),
+                                crate::audio_priority::MEDIA_CAP_MS,
+                                crate::audio_priority::prebuffer_label(media_primed, media_mix.len()),
+                                send_lag.as_micros(),
+                                crate::audio_priority::queue_ms(media_dropped)
                             ));
                             sent_packets = 0;
+                            media_dropped = 0;
                             rate_mark = std::time::Instant::now();
                         }
                     }
@@ -524,6 +593,7 @@ async fn video_pump(
     stop_v: Arc<Notify>,
     stats: Arc<Mutex<PumpStat>>,
     screen_recoverable: bool,
+    audio_link: Arc<crate::audio_priority::AudioLink>,
     video_pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     mut screen_ready_rx: mpsc::Receiver<crate::screen_session::ScreenCommand>,
     video_rx: mpsc::UnboundedReceiver<SourceEvent>,
@@ -547,6 +617,7 @@ async fn video_pump(
                     if let Some((w, h)) = pending_size.take() {
                         s.set_size(w, h);
                     }
+                    s.share_audio_link(audio_link.clone());
                     sender = Some(s);
                     crate::emit_force_keyframe();
                     emit_log(&format!("VIDEO: sender ready; discarded_before_ready_units={before_ready_units}; request fresh SPS/PPS/IDR"));
@@ -660,7 +731,7 @@ mod video_pump_tests {
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
             let stats=Arc::new(Mutex::new(PumpStat::default()));let stop=Arc::new(Notify::new());
             let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-            let pump=tokio::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx));
+            let pump=tokio::spawn(video_pump(stop.clone(),stats.clone(),recovery,Arc::new(crate::audio_priority::AudioLink::new()),pipeline,rx,video_rx));
             commands.send(crate::screen_session::ScreenCommand::Install(ScreenSender::new(
                 write,crate::screen::ScreenCipher::ChaCha([7;32]),1920,720,false,
             ))).await.unwrap();

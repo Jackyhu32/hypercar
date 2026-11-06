@@ -116,6 +116,11 @@ pub struct ScreenSender {
     last_owner: Option<bool>,
     tcp_diagnostics: Option<(std::sync::Arc<parking_lot::Mutex<crate::pipeline::Pipeline>>,u64)>,
     tcp_monitor: Option<crate::tcp_diagnostics::TcpMonitor>,
+    /// Set by the video pump. Absent in tests that do not care about audio priority.
+    audio_link: Option<std::sync::Arc<crate::audio_priority::AudioLink>>,
+    paced_video_writes: u64,
+    throttle_events: u64,
+    last_throttle_log: Option<tokio::time::Instant>,
 }
 
 impl ScreenSender {
@@ -161,7 +166,19 @@ impl ScreenSender {
             last_owner: None,
             tcp_diagnostics: None,
             tcp_monitor: None,
+            audio_link: None,
+            paced_video_writes: 0,
+            throttle_events: 0,
+            last_throttle_log: None,
         }
+    }
+
+    pub fn share_audio_link(&mut self, link: std::sync::Arc<crate::audio_priority::AudioLink>) {
+        self.audio_link = Some(link);
+    }
+
+    pub fn paced_video_writes(&self) -> u64 {
+        self.paced_video_writes
     }
 
     pub fn attach_diagnostics(&mut self,pipeline:std::sync::Arc<parking_lot::Mutex<crate::pipeline::Pipeline>>,connection_id:u64) {
@@ -385,7 +402,7 @@ impl ScreenSender {
         let mut wire = Vec::with_capacity(HEADER_LEN + body.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&body);
-        self.w.write_all(&wire).await?;
+        self.write_video_wire(&wire).await?;
 
         self.frames = self.frames.wrapping_add(1);
         self.wire_bytes = self.wire_bytes.wrapping_add(wire.len() as u64);
@@ -400,6 +417,48 @@ impl ScreenSender {
         self.frames_since_keep_alive = self.frames_since_keep_alive.wrapping_add(1);
         self.bytes_since_keep_alive = self.bytes_since_keep_alive.wrapping_add(plain.len() as u64);
         Ok(())
+    }
+
+    /// Large frames yield to media RTP when the audio pump says it is behind.
+    /// Config and keepAlive stay on a single write: those are small and timed.
+    async fn write_video_wire(&mut self, wire: &[u8]) -> std::io::Result<()> {
+        let reason = self.audio_link.as_ref().and_then(|link| link.video_pause(wire.len()));
+        let Some(reason) = reason else {
+            self.w.write_all(wire).await?;
+            return Ok(());
+        };
+        self.note_audio_throttle(&reason, wire.len());
+        tokio::time::sleep(Duration::from_micros(crate::audio_priority::AUDIO_PACKET_US)).await;
+        // 32KB chunks leave gaps for AC_VO audio to enter the driver queue
+        // instead of sitting behind one 0.5–1.7MB IDR.
+        const CHUNK: usize = 32 * 1024;
+        for chunk in wire.chunks(CHUNK) {
+            self.w.write_all(chunk).await?;
+            if self.audio_link.as_ref().and_then(|link| link.video_pause(wire.len())).is_some() {
+                tokio::task::yield_now().await;
+            }
+        }
+        self.paced_video_writes = self.paced_video_writes.wrapping_add(1);
+        Ok(())
+    }
+
+    fn note_audio_throttle(&mut self, reason: &crate::audio_priority::YieldReason, wire_len: usize) {
+        self.throttle_events = self.throttle_events.wrapping_add(1);
+        let due = self.last_throttle_log.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_throttle_log = Some(tokio::time::Instant::now());
+        crate::emit_log(&format!(
+            "VIDEO: throttle 音频优先 pause_us={} media={}ms lag_us={} wire={}B low_queue={} send_behind={} events={}",
+            crate::audio_priority::AUDIO_PACKET_US,
+            reason.media_ms,
+            reason.lag_us,
+            wire_len,
+            reason.low_queue,
+            reason.send_behind,
+            self.throttle_events
+        ));
     }
 
     /// 屏幕流 keepAlive（内部按 1s 节流，调用方在推流循环里逐帧调用即可）。
@@ -670,6 +729,44 @@ mod tests {
         let mut body = vec![0;n]; peer.read_exact(&mut body).await.unwrap();
         assert!(crate::bplist::parse(&body).unwrap().get("encoderCurrentFPS").is_some());
         assert_eq!(s.frame_counter, 0);
+    }
+
+    #[tokio::test]
+    async fn large_frame_is_paced_for_audio_without_changing_the_nal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_, write) = client.into_split();
+        let mut sender = ScreenSender::new(write, ScreenCipher::ChaCha([9; 32]), 2560, 1236, false);
+        let link = std::sync::Arc::new(crate::audio_priority::AudioLink::new());
+        link.publish(true, true, crate::audio_priority::samples_for_ms(10), std::time::Duration::from_micros(20_000));
+        sender.share_audio_link(link.clone());
+
+        let mut nal = vec![0x65u8, 0x80];
+        nal.resize(70_000, 0x11);
+        let mut annexb = vec![0, 0, 0, 1, 0x67, 0x42, 0, 0x1f, 0, 0, 0, 1, 0x68, 1, 0, 0, 0, 1];
+        annexb.extend_from_slice(&nal);
+        sender.send_video_annexb(&annexb, 2_000).await.unwrap();
+        assert_eq!(sender.paced_video_writes(), 1);
+
+        let mut header = [0u8; 128];
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[4], OP_CONFIG);
+        let mut config = vec![0; u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize];
+        peer.read_exact(&mut config).await.unwrap();
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[4], OP_FRAME);
+        let mut cipher = vec![0; u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize];
+        peer.read_exact(&mut cipher).await.unwrap();
+        let plain = crate::crypto::chacha_open(&[9; 32], &nonce64(0), &cipher, &header).unwrap();
+        let mut expected = (nal.len() as u32).to_be_bytes().to_vec();
+        expected.extend_from_slice(&nal);
+        assert_eq!(plain, expected);
+
+        link.publish(true, true, crate::audio_priority::samples_for_ms(300), std::time::Duration::ZERO);
+        sender.send_video_annexb(&[0, 0, 0, 1, 0x41, 3], 3_000).await.unwrap();
+        assert_eq!(sender.paced_video_writes(), 1, "a healthy media queue does not pace a P-frame");
+        assert_eq!(sender.frames_sent(), 2);
     }
 }
 
