@@ -26,6 +26,7 @@
 
 use crate::crypto::{chacha_seal, nonce64};
 use crate::timing::ntp_be;
+use std::os::fd::AsRawFd;
 use tokio::net::UdpSocket;
 
 /** 每包样本帧数 = AirPlay 标准 SPF 352（48000/352 ≈ 136 包/秒）。 */
@@ -158,6 +159,14 @@ impl AudioOut {
     /// 已发送音频包数（对外统计）。
     pub fn packets_sent(&self) -> u64 {
         self.packets
+    }
+
+    /// Mark the media RTP socket (and the sync socket, when present) ahead of
+    /// best-effort video TCP. PCM layout, SPF, and the RTP header stay the same.
+    pub fn prioritize_over_video(&self) -> String {
+        let data = crate::audio_priority::apply_udp_priority(self.udp.as_raw_fd());
+        let sync = self.sync.as_ref().map(|sock| crate::audio_priority::apply_udp_priority(sock.as_raw_fd()));
+        crate::audio_priority::format_udp_priority(&data, sync.as_ref())
     }
 }
 

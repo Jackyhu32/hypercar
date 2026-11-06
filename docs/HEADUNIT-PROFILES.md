@@ -40,6 +40,19 @@ BMW / generic / 小鹏 G6 启用 sendCarPlayAvailability。BMW / generic 同时�
 
 宝马及其它档案仍绑 IPv4，仍先发 25ms 原版，400 才试 airtunes475。
 
+### 小鹏 G6 音乐优先（+xpeng4）
+
++xpeng3 的屏幕 SETUP 不动。+xpeng4 只动手机侧音频泵和视频发送让路，不降分辨率、帧率或码率，也不改 PCM48k 立体声 SPF352。
+
+装上后看 `AUDIO` 行：
+
+- 启动附近有 `AUDIO: 媒体混音上限 2000ms（原先 500ms） 预缓冲 300ms`
+- 音频流就绪前有 `AUDIO: UDP 优先于视频 tos=0xb8 so_priority=6`
+- 播放中每秒 `队列 media=` 应靠近 `300ms`，`cap=2000ms`，`prebuffer=ready`，发包靠近 `136/s`，少见连续多秒低于 `130/s`
+- 大 IDR 挤占热点时可能出现 `VIDEO: throttle 音频优先 ... send_behind=true`，画面编码参数不变
+
+`dropped_ms` 长期为 0 表示 2s 上限没有在丢媒体。`prebuffer=fill` 停在几十毫秒表示预缓冲还没攒满。
+
 BMW MGU-55 是当前实车基准。Audi 与小鹏 G6 尚未完成本项目实车验证；generic 的 verified 字段也不代表所有车型均已测试。未知 ID 回退到 BMW。
 
 实现：[HeadUnitProfile](../app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt)。
